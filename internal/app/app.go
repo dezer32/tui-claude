@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,8 +14,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/vladislav-k/tui-claude/internal/config"
+	"github.com/vladislav-k/tui-claude/internal/ptymanager"
 	"github.com/vladislav-k/tui-claude/internal/session"
-	"github.com/vladislav-k/tui-claude/internal/tmux"
 )
 
 // State represents the current UI state.
@@ -31,12 +32,12 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	cfg     config.Config
-	keys    KeyMap
-	state   State
-	width   int
-	height  int
-	hasTmux bool
+	cfg    config.Config
+	keys   KeyMap
+	state  State
+	width  int
+	height int
+	ptyMgr *ptymanager.Manager
 
 	// Data
 	allSessions []session.Session
@@ -67,7 +68,7 @@ type Model struct {
 }
 
 // NewModel creates a new app model.
-func NewModel(cfg config.Config) Model {
+func NewModel(cfg config.Config, ptyMgr *ptymanager.Manager) Model {
 	// Search input
 	si := textinput.New()
 	si.Placeholder = "Search sessions..."
@@ -100,7 +101,7 @@ func NewModel(cfg config.Config) Model {
 		cfg:         cfg,
 		keys:        DefaultKeyMap(),
 		state:       StateNormal,
-		hasTmux:     config.HasTmux(),
+		ptyMgr:      ptyMgr,
 		runningIDs:  make(map[string]bool),
 		list:        l,
 		preview:     vp,
@@ -112,14 +113,11 @@ func NewModel(cfg config.Config) Model {
 
 // Init starts the program by loading sessions.
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{
+	return tea.Batch(
 		loadSessionsCmd(m.cfg.ClaudeDir),
-		tickCmd(2 * time.Second),
-	}
-	if m.hasTmux {
-		cmds = append(cmds, detectRunningCmd())
-	}
-	return tea.Batch(cmds...)
+		tickCmd(2*time.Second),
+		m.detectRunningCmd(),
+	)
 }
 
 func loadSessionsCmd(claudeDir string) tea.Cmd {
@@ -155,12 +153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case RunningSessionsMsg:
-		// Match short IDs to full session IDs
-		var sessionIDs []string
-		for _, s := range m.allSessions {
-			sessionIDs = append(sessionIDs, s.SessionID)
-		}
-		m.runningIDs = tmux.MatchRunning(msg.RunningIDs, sessionIDs)
+		m.runningIDs = msg.RunningIDs
 		m.applyFilters()
 		return m, nil
 
@@ -176,11 +169,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case LiveCaptureMsg:
-		if msg.Err == nil {
-			m.previewContent = msg.Content
-			m.preview.SetContent(m.previewContent)
-		}
+		m.previewContent = msg.Content
+		m.preview.SetContent(m.previewContent)
 		return m, nil
+
+	case attachMsg:
+		return m, tea.Exec(
+			&attachExecCmd{mgr: m.ptyMgr, sessionID: msg.session.SessionID},
+			func(err error) tea.Msg {
+				return SessionResumedMsg{Session: msg.session, Err: err}
+			},
+		)
 
 	case DialogResultMsg:
 		return m.handleDialogResult(msg)
@@ -219,16 +218,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// Periodic refresh: detect running sessions, refresh live preview
-		var cmds []tea.Cmd
-		if m.hasTmux {
-			cmds = append(cmds, detectRunningCmd())
+		cmds := []tea.Cmd{
+			m.detectRunningCmd(),
+			tickCmd(2 * time.Second),
 		}
 		if m.previewMode == PreviewLive {
 			if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 				cmds = append(cmds, m.liveCaptureCmd(sel.session))
 			}
 		}
-		cmds = append(cmds, tickCmd(2*time.Second))
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
@@ -659,10 +657,6 @@ func (m Model) renderStatusBar() string {
 		left = Styles.Error.Render("Error: " + m.lastError)
 	}
 
-	if !m.hasTmux {
-		right = "[view-only] " + right
-	}
-
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 0 {
 		gap = 0
@@ -708,7 +702,7 @@ func (m Model) renderSearchOverlay(base string) string {
 func (m Model) renderHelp() string {
 	bindings := []struct{ key, desc string }{
 		{"↑/k, ↓/j", "Navigate list"},
-		{"Enter", "Resume session in tmux"},
+		{"Enter", "Resume session"},
 		{"n", "New Claude session"},
 		{"d", "Delete session"},
 		{"r", "Rename (edit summary)"},
@@ -824,33 +818,41 @@ func (m Model) loadPreviewCmd(s session.Session) tea.Cmd {
 
 func (m Model) liveCaptureCmd(s session.Session) tea.Cmd {
 	return func() tea.Msg {
-		windowName := tmux.WindowName(s.ShortID())
-		if !tmux.WindowExists(windowName) {
-			return LiveCaptureMsg{SessionID: s.SessionID, Content: "Session not running in tmux"}
+		if !m.ptyMgr.IsRunning(s.SessionID) {
+			return LiveCaptureMsg{SessionID: s.SessionID, Content: "Session not running"}
 		}
-		content, err := tmux.CapturPane(windowName)
-		return LiveCaptureMsg{SessionID: s.SessionID, Content: content, Err: err}
+		content := m.ptyMgr.Capture(s.SessionID)
+		return LiveCaptureMsg{SessionID: s.SessionID, Content: content}
 	}
 }
 
 func (m Model) resumeSessionCmd(s session.Session) tea.Cmd {
+	if m.ptyMgr.IsRunning(s.SessionID) {
+		// Already running — attach to it
+		return tea.Exec(
+			&attachExecCmd{mgr: m.ptyMgr, sessionID: s.SessionID},
+			func(err error) tea.Msg {
+				return SessionResumedMsg{Session: s, Err: err}
+			},
+		)
+	}
+	// Launch in PTY, then attach
 	return func() tea.Msg {
-		if !m.hasTmux {
-			return SessionResumedMsg{Session: s, Err: fmt.Errorf("tmux not available")}
+		if err := m.ptyMgr.Launch(s.SessionID, s.ProjectPath); err != nil {
+			return SessionResumedMsg{Session: s, Err: err}
 		}
-		err := tmux.CreateWindow(s.SessionID, s.ShortID(), s.ProjectPath)
-		return SessionResumedMsg{Session: s, Err: err}
+		return attachMsg{session: s}
 	}
 }
 
 func (m Model) newSessionCmd() tea.Cmd {
 	return func() tea.Msg {
-		if !m.hasTmux {
-			return SessionResumedMsg{Err: fmt.Errorf("tmux not available")}
-		}
 		home, _ := os.UserHomeDir()
-		err := tmux.CreateNewSession(home)
-		return SessionResumedMsg{Err: err}
+		sessionID := fmt.Sprintf("new-%d", time.Now().UnixNano())
+		if err := m.ptyMgr.LaunchNew(sessionID, home); err != nil {
+			return SessionResumedMsg{Err: err}
+		}
+		return attachMsg{session: session.Session{SessionID: sessionID, ProjectPath: home}}
 	}
 }
 
@@ -884,12 +886,31 @@ func (m Model) archiveSessionCmd(s session.Session) tea.Cmd {
 	}
 }
 
-func detectRunningCmd() tea.Cmd {
+func (m Model) detectRunningCmd() tea.Cmd {
 	return func() tea.Msg {
-		shortIDs := tmux.DetectRunning()
-		return RunningSessionsMsg{RunningIDs: shortIDs}
+		running := m.ptyMgr.DetectRunning()
+		return RunningSessionsMsg{RunningIDs: running}
 	}
 }
+
+// attachMsg signals that a PTY session was launched and needs attaching.
+type attachMsg struct {
+	session session.Session
+}
+
+// attachExecCmd implements tea.ExecCommand for in-process PTY attach.
+type attachExecCmd struct {
+	mgr       *ptymanager.Manager
+	sessionID string
+}
+
+func (a *attachExecCmd) Run() error {
+	return ptymanager.AttachFunc(a.mgr, a.sessionID)()
+}
+
+func (a *attachExecCmd) SetStdin(io.Reader)  {}
+func (a *attachExecCmd) SetStdout(io.Writer) {}
+func (a *attachExecCmd) SetStderr(io.Writer) {}
 
 // tickCmd returns a command that sends a tick after the given duration.
 type tickMsg time.Time

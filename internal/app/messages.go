@@ -16,7 +16,7 @@ type SessionSelectedMsg struct {
 	Session session.Session
 }
 
-// SessionResumedMsg is sent when a session is resumed in tmux.
+// SessionResumedMsg is sent when a session is resumed.
 type SessionResumedMsg struct {
 	Session session.Session
 	Err     error
@@ -49,11 +49,10 @@ type PreviewLoadedMsg struct {
 	Err       error
 }
 
-// LiveCaptureMsg contains tmux capture-pane output.
+// LiveCaptureMsg contains PTY capture output.
 type LiveCaptureMsg struct {
 	SessionID string
 	Content   string
-	Err       error
 }
 
 // RunningSessionsMsg contains list of currently running session IDs.
