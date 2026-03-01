@@ -86,6 +86,11 @@ func Export(s Session, outputDir string, maxSize int64, maxMessages int) (string
 
 // Archive moves session file to an archive directory.
 func Archive(s Session) error {
+	// If source file doesn't exist, just remove from index
+	if _, err := os.Stat(s.FullPath); os.IsNotExist(err) {
+		return removeFromIndex(s)
+	}
+
 	archiveDir := filepath.Join(filepath.Dir(s.FullPath), "archive")
 	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 		return err
