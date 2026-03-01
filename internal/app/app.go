@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -80,20 +81,32 @@ func NewModel(cfg config.Config, ptyMgr *ptymanager.Manager) Model {
 	si := textinput.New()
 	si.Placeholder = "Search sessions..."
 	si.Prompt = "/ "
+	si.PromptStyle = lipgloss.NewStyle().Foreground(ColorCyan)
+	si.TextStyle = lipgloss.NewStyle().Foreground(ColorTextBright)
 
 	// Rename input
 	ri := textinput.New()
 	ri.Placeholder = "New summary..."
 	ri.Prompt = "> "
+	ri.PromptStyle = lipgloss.NewStyle().Foreground(ColorCyan)
+	ri.TextStyle = lipgloss.NewStyle().Foreground(ColorTextBright)
 
 	// List delegate
 	delegate := list.NewDefaultDelegate()
 	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.
-		Foreground(ColorWhite).
-		BorderLeftForeground(ColorPrimary)
+		Foreground(ColorCyan).
+		BorderLeftForeground(ColorCyan)
 	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
-		Foreground(ColorSecondary).
-		BorderLeftForeground(ColorPrimary)
+		Foreground(ColorTextNormal).
+		BorderLeftForeground(ColorCyan)
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.
+		Foreground(ColorTextBright)
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.
+		Foreground(ColorTextMuted)
+	delegate.Styles.DimmedTitle = delegate.Styles.DimmedTitle.
+		Foreground(ColorTextMuted)
+	delegate.Styles.DimmedDesc = delegate.Styles.DimmedDesc.
+		Foreground(ColorTextMuted)
 
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "Sessions"
@@ -559,16 +572,21 @@ func (m Model) View() string {
 func (m *Model) updateLayout() {
 	tabBarHeight := 1
 	statusBarHeight := 1
-	contentHeight := m.height - tabBarHeight - statusBarHeight - 2 // borders
+	contentHeight := m.height - tabBarHeight - statusBarHeight
 
 	listWidth := m.width * 2 / 5
 	if !m.cfg.PreviewEnabled {
 		listWidth = m.width
 	}
 
-	m.list.SetSize(listWidth, contentHeight)
-	m.preview.Width = m.width - listWidth - 3 // border + padding
-	m.preview.Height = contentHeight
+	previewWidth := m.width - listWidth
+
+	// List: subtract panel borders (2 left+right) for inner content
+	m.list.SetSize(listWidth-2, contentHeight-2)
+	// Preview: subtract panel borders (2) + inner padding (2)
+	m.preview.Width = previewWidth - 2 - 2
+	// Preview: subtract top+bottom borders, title is in the top border
+	m.preview.Height = contentHeight - 2
 }
 
 func (m *Model) applyFilters() {
@@ -666,10 +684,10 @@ type sessionItem struct {
 func (i sessionItem) Title() string {
 	prefix := "  "
 	if i.session.IsRunning {
-		prefix = "● "
+		prefix = Styles.RunningDot.Render("●") + " "
 	}
 	if i.session.Selected {
-		prefix = "✓ "
+		prefix = Styles.SelectedMark.Render("▸") + " "
 	}
 	return prefix + i.session.DisplayTitle()
 }
@@ -699,11 +717,12 @@ func uitoa(i int) string {
 // Render methods
 
 func (m Model) renderTabBar() string {
+	titleIcon := Styles.PanelTitle.Render("◆")
 	title := Styles.Title.Render("tui-claude")
 
 	if m.archiveMode {
 		badge := Styles.ArchiveBadge.Render("ARCHIVED")
-		bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge)
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge)
 
 		if m.allMode {
 			tabs := []string{"All"}
@@ -719,21 +738,19 @@ func (m Model) renderTabBar() string {
 				}
 			}
 			tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-			bar = lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge, "  ", tabLine)
+			bar = lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge, "  ", tabLine)
 		}
 
 		return Styles.TabBar.Width(m.width).Render(bar)
 	}
 
 	if !m.allMode {
-		// Current directory mode: show project name
 		dirName := filepath.Base(m.cfg.WorkDir)
 		dirLabel := Styles.TabActive.Render("@ " + dirName)
-		bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", dirLabel)
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", dirLabel)
 		return Styles.TabBar.Width(m.width).Render(bar)
 	}
 
-	// All mode: show project tabs
 	tabs := []string{"All"}
 	for _, p := range m.projects {
 		tabs = append(tabs, p.Name)
@@ -749,11 +766,17 @@ func (m Model) renderTabBar() string {
 	}
 
 	tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-	bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", tabLine)
+	bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", tabLine)
 	return Styles.TabBar.Width(m.width).Render(bar)
 }
 
 func (m Model) renderContent() string {
+	listWidth := m.width * 2 / 5
+	if !m.cfg.PreviewEnabled {
+		listWidth = m.width
+	}
+	contentHeight := m.height - 2 // tabBar + statusBar
+
 	listView := m.list.View()
 
 	// Show hint when no sessions
@@ -765,34 +788,112 @@ func (m Model) renderContent() string {
 			hint = Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
 		}
 		if hint != "" {
-			listView = lipgloss.Place(m.width*2/5, m.height-4, lipgloss.Center, lipgloss.Center, hint)
+			listView = lipgloss.Place(listWidth-2, contentHeight-2, lipgloss.Center, lipgloss.Center, hint)
 		}
 	}
 
+	// List panel title
+	listTitle := "Sessions (" + itoa(len(m.sessions)) + ")"
+	listBorderColor := ColorBorderDim
+	listTitleColor := ColorCyan
+	listPanel := renderTitledPanel(listTitle, listView, listWidth, contentHeight, listBorderColor, listTitleColor)
+
 	if !m.cfg.PreviewEnabled {
-		return listView
+		return listPanel
 	}
 
 	// Preview panel
-	previewTabs := m.renderPreviewTabs()
+	previewWidth := m.width - listWidth
 	previewContent := m.preview.View()
-	previewPanel := lipgloss.JoinVertical(lipgloss.Left, previewTabs, previewContent)
-	previewPanel = Styles.Preview.Height(m.height - 4).Render(previewPanel)
+	previewTitle := m.previewTitleLine()
+	previewBorderColor := ColorBorderDim
+	previewTitleColor := ColorCyan
+	previewPanel := renderTitledPanel(previewTitle, previewContent, previewWidth, contentHeight, previewBorderColor, previewTitleColor)
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, listView, previewPanel)
+	return lipgloss.JoinHorizontal(lipgloss.Top, listPanel, previewPanel)
 }
 
-func (m Model) renderPreviewTabs() string {
+func (m Model) previewTitleLine() string {
 	modes := []PreviewMode{PreviewLive, PreviewMessages, PreviewMeta}
-	var tabs []string
+	var parts []string
 	for _, mode := range modes {
 		if mode == m.previewMode {
-			tabs = append(tabs, Styles.PreviewTabAct.Render("["+mode.String()+"]"))
+			parts = append(parts, Styles.PreviewTabAct.Render(mode.String()))
 		} else {
-			tabs = append(tabs, Styles.PreviewTab.Render("["+mode.String()+"]"))
+			parts = append(parts, Styles.PreviewTab.Render(mode.String()))
 		}
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Left, tabs...)
+	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+}
+
+// renderTitledPanel creates a panel with a title embedded in the top border.
+func renderTitledPanel(title, content string, width, height int, borderColor, titleColor lipgloss.Color) string {
+	if width < 4 {
+		return content
+	}
+
+	innerWidth := width - 2 // left + right border chars
+
+	// Style for border characters
+	borderStyle := lipgloss.NewStyle().Foreground(borderColor)
+	titleStyle := lipgloss.NewStyle().Foreground(titleColor).Bold(true)
+
+	// Top line: ╭─ Title ─────╮
+	titleText := titleStyle.Render(title)
+	titleVisualWidth := lipgloss.Width(titleText)
+	topFillWidth := innerWidth - 2 - titleVisualWidth // 2 = "─ " before title + " " after
+	if topFillWidth < 0 {
+		topFillWidth = 0
+	}
+	topFill := ""
+	for i := 0; i < topFillWidth; i++ {
+		topFill += "─"
+	}
+	topLine := borderStyle.Render("╭─") + " " + titleText + " " + borderStyle.Render(topFill+"╮")
+
+	// Bottom line: ╰──────────╯
+	bottomFill := ""
+	for i := 0; i < innerWidth; i++ {
+		bottomFill += "─"
+	}
+	bottomLine := borderStyle.Render("╰" + bottomFill + "╯")
+
+	// Side borders for content
+	leftBorder := borderStyle.Render("│")
+	rightBorder := borderStyle.Render("│")
+
+	// Wrap content lines with side borders
+	contentLines := strings.Split(content, "\n")
+	innerHeight := height - 2 // top + bottom border
+	if innerHeight < 0 {
+		innerHeight = 0
+	}
+
+	// Pad or truncate content to fill the panel height
+	for len(contentLines) < innerHeight {
+		contentLines = append(contentLines, "")
+	}
+	if len(contentLines) > innerHeight {
+		contentLines = contentLines[:innerHeight]
+	}
+
+	var body strings.Builder
+	for _, line := range contentLines {
+		lineWidth := lipgloss.Width(line)
+		pad := innerWidth - lineWidth
+		if pad < 0 {
+			pad = 0
+		}
+		padding := strings.Repeat(" ", pad)
+		body.WriteString(leftBorder + line + padding + rightBorder + "\n")
+	}
+
+	return topLine + "\n" + body.String() + bottomLine
+}
+
+// renderKeyHint formats a key hint for the status bar.
+func renderKeyHint(key, desc string) string {
+	return Styles.HelpKey.Render(key) + " " + Styles.HelpDesc.Render(desc)
 }
 
 func (m Model) renderStatusBar() string {
@@ -808,31 +909,42 @@ func (m Model) renderStatusBar() string {
 
 	mode := "Current dir"
 	if m.allMode {
-		mode = "All projects"
+		mode = "All"
 	}
 
-	left := sessionCount + " sessions | " + projectCount + " projects | Sort: " + sort + " | " + mode
-	right := "q:quit /:search a:toggle V:archive ?:help"
+	sep := Styles.StatusSep.Render(" │ ")
 
+	left := Styles.StatusVal.Render(sessionCount) + " sessions" + sep +
+		Styles.StatusVal.Render(projectCount) + " projects" + sep +
+		"Sort: " + Styles.StatusVal.Render(sort) + sep + mode
+
+	var right string
 	if m.archiveMode {
-		left = "[ARCHIVED] " + left
-		right = "A:restore d:delete e:export V:back ?:help"
+		left = Styles.ArchiveBadge.Render("ARCHIVED") + "  " + left
+		right = renderKeyHint("A", "restore") + sep +
+			renderKeyHint("d", "delete") + sep +
+			renderKeyHint("e", "export") + sep +
+			renderKeyHint("V", "back") + sep +
+			renderKeyHint("?", "help")
+	} else {
+		right = renderKeyHint("q", "quit") + sep +
+			renderKeyHint("/", "search") + sep +
+			renderKeyHint("a", "toggle") + sep +
+			renderKeyHint("?", "help")
 	}
 
 	if m.lastError != "" {
 		left = Styles.Error.Render("Error: " + m.lastError)
 	}
 
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	gap := m.width - leftWidth - rightWidth - 2
 	if gap < 0 {
 		gap = 0
 	}
-	padding := ""
-	for i := 0; i < gap; i++ {
-		padding += " "
-	}
 
-	return Styles.StatusBar.Width(m.width).Render(left + padding + right)
+	return Styles.StatusBar.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
 }
 
 func (m Model) renderConfirmOverlay(base string) string {
@@ -844,8 +956,8 @@ func (m Model) renderConfirmOverlay(base string) string {
 		title = "Restore session from archive?"
 	}
 	dialog := Styles.DialogTitle.Render(title) + "\n\n" +
-		"Press " + Styles.HelpKey.Render("y") + " to confirm, " +
-		Styles.HelpKey.Render("n") + " to cancel"
+		"Press " + Styles.ConfirmYes.Render("y") + " to confirm, " +
+		Styles.ConfirmNo.Render("n") + " to cancel"
 	box := Styles.Dialog.Render(dialog)
 	return placeOverlay(m.width, m.height-2, box, base)
 }
@@ -861,7 +973,8 @@ func (m Model) renderRenameOverlay(base string) string {
 func (m Model) renderSearchOverlay(base string) string {
 	searchBox := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(ColorPrimary).
+		BorderForeground(ColorCyan).
+		Background(ColorBgSurface).
 		Padding(0, 1).
 		Width(40).
 		Render(m.searchInput.View())
@@ -962,26 +1075,38 @@ func renderMessages(msgs []ParsedMessage, width int) string {
 		glamour.WithWordWrap(width),
 	)
 
-	var out string
-	for _, msg := range msgs {
+	sepWidth := width
+	if sepWidth > 40 {
+		sepWidth = 40
+	}
+	separator := Styles.MsgSeparator.Render(strings.Repeat("─", sepWidth))
+
+	var out strings.Builder
+	for i, msg := range msgs {
+		if i > 0 {
+			out.WriteString(separator + "\n")
+		}
 		switch msg.Type {
 		case "user":
-			out += Styles.UserMsg.Render("> "+msg.Content) + "\n\n"
+			out.WriteString(Styles.UserLabel.Render("YOU") + "\n")
+			out.WriteString(Styles.UserMsg.Render(msg.Content) + "\n\n")
 		case "assistant":
+			out.WriteString(Styles.AssistantLabel.Render("CLAUDE") + "\n")
 			if renderer != nil {
 				if rendered, err := renderer.Render(msg.Content); err == nil {
-					out += rendered + "\n"
+					out.WriteString(rendered + "\n")
 				} else {
-					out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+					out.WriteString(Styles.AssistantMsg.Render(msg.Content) + "\n\n")
 				}
 			} else {
-				out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+				out.WriteString(Styles.AssistantMsg.Render(msg.Content) + "\n\n")
 			}
 		case "summary":
-			out += Styles.SummaryMsg.Render("Summary: "+msg.Content) + "\n\n"
+			out.WriteString(Styles.SummaryLabel.Render("SUMMARY") + "\n")
+			out.WriteString(Styles.SummaryMsg.Render(msg.Content) + "\n\n")
 		}
 	}
-	return out
+	return out.String()
 }
 
 // placeOverlay places a dialog box centered over the base content.
