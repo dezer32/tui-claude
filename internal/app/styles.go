@@ -45,6 +45,7 @@ var Styles = struct {
 	Dialog        lipgloss.Style
 	DialogTitle   lipgloss.Style
 	Error         lipgloss.Style
+	ArchiveBadge  lipgloss.Style
 }{
 	App: lipgloss.NewStyle(),
 
@@ -160,4 +161,10 @@ var Styles = struct {
 
 	Error: lipgloss.NewStyle().
 		Foreground(ColorWarning),
+
+	ArchiveBadge: lipgloss.NewStyle().
+		Foreground(ColorWhite).
+		Background(ColorWarning).
+		Bold(true).
+		Padding(0, 1),
 }

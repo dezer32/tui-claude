@@ -128,6 +128,16 @@ func (m *Manager) SetForward(sessionID string, w io.Writer) {
 	}
 }
 
+// ResizeEmulator updates the VT emulator dimensions for a session.
+func (m *Manager) ResizeEmulator(sessionID string, w, h int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if s, ok := m.sessions[sessionID]; ok {
+		s.ResizeEmulator(w, h)
+	}
+}
+
 // Remove removes a finished session from the manager.
 func (m *Manager) Remove(sessionID string) {
 	m.mu.Lock()

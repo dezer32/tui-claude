@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/vladislav-k/tui-claude/internal/config"
 	"github.com/vladislav-k/tui-claude/internal/ptymanager"
@@ -54,7 +55,12 @@ type Model struct {
 	// Tab state
 	activeTab    int // 0 = All, 1+ = project index
 	allMode      bool // true = show all sessions, false = current dir only
+	archiveMode  bool // true = viewing archived sessions
 	previewMode  PreviewMode
+
+	// Archived sessions
+	archivedSessions []session.Session
+	archivedProjects []session.Project
 
 	// Dialog state
 	confirmAction ConfirmAction
@@ -142,6 +148,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.updateLayout()
+		// Sync VT emulator size with preview viewport for running sessions
+		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
+			m.ptyMgr.ResizeEmulator(sel.session.SessionID, m.preview.Width, m.preview.Height)
+		}
 		return m, nil
 
 	case SessionsLoadedMsg:
@@ -164,7 +174,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previewContent = "Could not parse session data"
 		} else {
 			m.previewSession = msg.SessionID
-			m.previewContent = renderMessages(msg.Messages)
+			m.previewContent = renderMessages(msg.Messages, m.preview.Width)
 		}
 		m.preview.SetContent(m.previewContent)
 		m.preview.GotoTop()
@@ -190,7 +200,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.lastError = msg.Err.Error()
 		} else {
-			m.removeSession(msg.SessionID)
+			if m.archiveMode {
+				m.removeArchivedSession(msg.SessionID)
+			} else {
+				m.removeSession(msg.SessionID)
+			}
 		}
 		m.state = StateNormal
 		return m, nil
@@ -206,6 +220,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastError = msg.Err.Error()
 		} else {
 			m.lastError = "" // clear
+		}
+		return m, nil
+
+	case ArchivedSessionsLoadedMsg:
+		if msg.Err != nil {
+			m.lastError = msg.Err.Error()
+			return m, nil
+		}
+		m.archivedSessions = msg.Sessions
+		m.archivedProjects = msg.Projects
+		m.applyFilters()
+		return m, nil
+
+	case SessionRestoredMsg:
+		if msg.Err != nil {
+			m.lastError = msg.Err.Error()
+		} else {
+			// Reload both collections
+			return m, tea.Batch(
+				loadSessionsCmd(m.cfg.ClaudeDir),
+				m.loadArchivedSessionsCmd(),
+			)
 		}
 		return m, nil
 
@@ -306,7 +342,23 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.applyFilters()
 		return m, nil
 
+	case key.Matches(msg, m.keys.ToggleArchive):
+		m.archiveMode = !m.archiveMode
+		m.activeTab = 0
+		if m.archiveMode && len(m.archivedSessions) == 0 {
+			m.applyFilters()
+			return m, m.loadArchivedSessionsCmd()
+		}
+		m.applyFilters()
+		return m, nil
+
 	case key.Matches(msg, m.keys.Refresh):
+		if m.archiveMode {
+			return m, tea.Batch(
+				loadSessionsCmd(m.cfg.ClaudeDir),
+				m.loadArchivedSessionsCmd(),
+			)
+		}
 		return m, loadSessionsCmd(m.cfg.ClaudeDir)
 
 	case key.Matches(msg, m.keys.TabSwitch):
@@ -352,6 +404,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Rename):
+		if m.archiveMode {
+			return m, nil
+		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 			m.state = StateRenameDialog
 			m.renameInput.Reset()
@@ -362,6 +417,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Enter):
+		if m.archiveMode {
+			return m, nil
+		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 			return m, m.resumeSessionCmd(sel.session)
 		}
@@ -374,12 +432,21 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.New):
+		if m.archiveMode {
+			return m, nil
+		}
 		return m, m.newSessionCmd()
 
 	case key.Matches(msg, m.keys.Archive):
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
-			m.state = StateConfirmDialog
-			m.confirmAction = ConfirmArchive
+			if m.archiveMode {
+				// In archive mode, A = restore
+				m.state = StateConfirmDialog
+				m.confirmAction = ConfirmRestore
+			} else {
+				m.state = StateConfirmDialog
+				m.confirmAction = ConfirmArchive
+			}
 			_ = sel
 		}
 		return m, nil
@@ -439,6 +506,8 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.deleteSessionCmd(sel.session)
 			case ConfirmArchive:
 				return m, m.archiveSessionCmd(sel.session)
+			case ConfirmRestore:
+				return m, m.restoreSessionCmd(sel.session)
 			}
 		}
 		m.state = StateNormal
@@ -503,7 +572,16 @@ func (m *Model) updateLayout() {
 }
 
 func (m *Model) applyFilters() {
-	filtered := m.allSessions
+	var filtered []session.Session
+	var activeProjects []session.Project
+
+	if m.archiveMode {
+		filtered = m.archivedSessions
+		activeProjects = m.archivedProjects
+	} else {
+		filtered = m.allSessions
+		activeProjects = m.projects
+	}
 
 	// WorkDir filter (current directory mode)
 	if !m.allMode && m.cfg.WorkDir != "" {
@@ -511,8 +589,8 @@ func (m *Model) applyFilters() {
 	}
 
 	// Tab filter (only in allMode)
-	if m.allMode && m.activeTab > 0 && m.activeTab <= len(m.projects) {
-		filtered = session.FilterByProject(filtered, m.projects[m.activeTab-1].Path)
+	if m.allMode && m.activeTab > 0 && m.activeTab <= len(activeProjects) {
+		filtered = session.FilterByProject(filtered, activeProjects[m.activeTab-1].Path)
 	}
 
 	// Sort
@@ -523,7 +601,9 @@ func (m *Model) applyFilters() {
 	// Update list items
 	items := make([]list.Item, len(filtered))
 	for i, s := range filtered {
-		s.IsRunning = m.runningIDs[s.SessionID]
+		if !m.archiveMode {
+			s.IsRunning = m.runningIDs[s.SessionID]
+		}
 		items[i] = sessionItem{session: s}
 	}
 	m.list.SetItems(items)
@@ -554,6 +634,17 @@ func (m *Model) removeSession(id string) {
 		}
 	}
 	m.allSessions = remaining
+	m.applyFilters()
+}
+
+func (m *Model) removeArchivedSession(id string) {
+	var remaining []session.Session
+	for _, s := range m.archivedSessions {
+		if s.SessionID != id {
+			remaining = append(remaining, s)
+		}
+	}
+	m.archivedSessions = remaining
 	m.applyFilters()
 }
 
@@ -610,6 +701,30 @@ func uitoa(i int) string {
 func (m Model) renderTabBar() string {
 	title := Styles.Title.Render("tui-claude")
 
+	if m.archiveMode {
+		badge := Styles.ArchiveBadge.Render("ARCHIVED")
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge)
+
+		if m.allMode {
+			tabs := []string{"All"}
+			for _, p := range m.archivedProjects {
+				tabs = append(tabs, p.Name)
+			}
+			var rendered []string
+			for i, t := range tabs {
+				if i == m.activeTab {
+					rendered = append(rendered, Styles.TabActive.Render(t))
+				} else {
+					rendered = append(rendered, Styles.TabInactive.Render(t))
+				}
+			}
+			tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
+			bar = lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge, "  ", tabLine)
+		}
+
+		return Styles.TabBar.Width(m.width).Render(bar)
+	}
+
 	if !m.allMode {
 		// Current directory mode: show project name
 		dirName := filepath.Base(m.cfg.WorkDir)
@@ -641,10 +756,17 @@ func (m Model) renderTabBar() string {
 func (m Model) renderContent() string {
 	listView := m.list.View()
 
-	// Show hint when no sessions in current dir mode
-	if !m.allMode && len(m.sessions) == 0 && len(m.allSessions) > 0 {
-		hint := Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
-		listView = lipgloss.Place(m.width*2/5, m.height-4, lipgloss.Center, lipgloss.Center, hint)
+	// Show hint when no sessions
+	if len(m.sessions) == 0 {
+		var hint string
+		if m.archiveMode {
+			hint = Styles.HelpDesc.Render("No archived sessions.\nPress " + Styles.HelpKey.Render("V") + " to go back.")
+		} else if !m.allMode && len(m.allSessions) > 0 {
+			hint = Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
+		}
+		if hint != "" {
+			listView = lipgloss.Place(m.width*2/5, m.height-4, lipgloss.Center, lipgloss.Center, hint)
+		}
 	}
 
 	if !m.cfg.PreviewEnabled {
@@ -675,8 +797,14 @@ func (m Model) renderPreviewTabs() string {
 
 func (m Model) renderStatusBar() string {
 	sessionCount := itoa(len(m.sessions))
-	projectCount := itoa(len(m.projects))
 	sort := m.sortField.String()
+
+	var projectCount string
+	if m.archiveMode {
+		projectCount = itoa(len(m.archivedProjects))
+	} else {
+		projectCount = itoa(len(m.projects))
+	}
 
 	mode := "Current dir"
 	if m.allMode {
@@ -684,7 +812,12 @@ func (m Model) renderStatusBar() string {
 	}
 
 	left := sessionCount + " sessions | " + projectCount + " projects | Sort: " + sort + " | " + mode
-	right := "q:quit /:search a:toggle ?:help"
+	right := "q:quit /:search a:toggle V:archive ?:help"
+
+	if m.archiveMode {
+		left = "[ARCHIVED] " + left
+		right = "A:restore d:delete e:export V:back ?:help"
+	}
 
 	if m.lastError != "" {
 		left = Styles.Error.Render("Error: " + m.lastError)
@@ -704,8 +837,11 @@ func (m Model) renderStatusBar() string {
 
 func (m Model) renderConfirmOverlay(base string) string {
 	title := "Delete session?"
-	if m.confirmAction == ConfirmArchive {
+	switch m.confirmAction {
+	case ConfirmArchive:
 		title = "Archive session?"
+	case ConfirmRestore:
+		title = "Restore session from archive?"
 	}
 	dialog := Styles.DialogTitle.Render(title) + "\n\n" +
 		"Press " + Styles.HelpKey.Render("y") + " to confirm, " +
@@ -733,24 +869,45 @@ func (m Model) renderSearchOverlay(base string) string {
 }
 
 func (m Model) renderHelp() string {
-	bindings := []struct{ key, desc string }{
-		{"↑/k, ↓/j", "Navigate list"},
-		{"Enter", "Resume session"},
-		{"n", "New Claude session"},
-		{"d", "Delete session"},
-		{"r", "Rename (edit summary)"},
-		{"/", "Search sessions"},
-		{"s", "Cycle sort (date/project/messages)"},
-		{"a", "Toggle all projects / current dir"},
-		{"Tab", "Switch preview mode"},
-		{"Space", "Multi-select"},
-		{"e", "Export to markdown"},
-		{"A", "Archive session"},
-		{"h/l", "Switch project tabs (all mode)"},
-		{"?", "This help"},
-		{"S", "Statistics"},
-		{"R", "Refresh list"},
-		{"q", "Quit"},
+	var bindings []struct{ key, desc string }
+
+	if m.archiveMode {
+		bindings = []struct{ key, desc string }{
+			{"↑/k, ↓/j", "Navigate list"},
+			{"A", "Restore session"},
+			{"d", "Delete session"},
+			{"e", "Export to markdown"},
+			{"/", "Search sessions"},
+			{"s", "Cycle sort (date/project/messages)"},
+			{"a", "Toggle all projects / current dir"},
+			{"Tab", "Switch preview mode"},
+			{"h/l", "Switch project tabs (all mode)"},
+			{"V", "Back to active sessions"},
+			{"?", "This help"},
+			{"R", "Refresh list"},
+			{"q", "Quit"},
+		}
+	} else {
+		bindings = []struct{ key, desc string }{
+			{"↑/k, ↓/j", "Navigate list"},
+			{"Enter", "Resume session"},
+			{"n", "New Claude session"},
+			{"d", "Delete session"},
+			{"r", "Rename (edit summary)"},
+			{"/", "Search sessions"},
+			{"s", "Cycle sort (date/project/messages)"},
+			{"a", "Toggle all projects / current dir"},
+			{"Tab", "Switch preview mode"},
+			{"Space", "Multi-select"},
+			{"e", "Export to markdown"},
+			{"A", "Archive session"},
+			{"V", "View archived sessions"},
+			{"h/l", "Switch project tabs (all mode)"},
+			{"?", "This help"},
+			{"S", "Statistics"},
+			{"R", "Refresh list"},
+			{"q", "Quit"},
+		}
 	}
 
 	title := Styles.Title.Render("Keyboard Shortcuts") + "\n\n"
@@ -795,14 +952,31 @@ func (m Model) renderStats() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-func renderMessages(msgs []ParsedMessage) string {
+func renderMessages(msgs []ParsedMessage, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+
+	renderer, _ := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(width),
+	)
+
 	var out string
 	for _, msg := range msgs {
 		switch msg.Type {
 		case "user":
 			out += Styles.UserMsg.Render("> "+msg.Content) + "\n\n"
 		case "assistant":
-			out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+			if renderer != nil {
+				if rendered, err := renderer.Render(msg.Content); err == nil {
+					out += rendered + "\n"
+				} else {
+					out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+				}
+			} else {
+				out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+			}
 		case "summary":
 			out += Styles.SummaryMsg.Render("Summary: "+msg.Content) + "\n\n"
 		}
@@ -918,6 +1092,24 @@ func (m Model) archiveSessionCmd(s session.Session) tea.Cmd {
 	return func() tea.Msg {
 		err := session.Archive(s)
 		return SessionDeletedMsg{SessionID: s.SessionID, Err: err}
+	}
+}
+
+func (m Model) loadArchivedSessionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		sessions, projects, err := session.LoadArchived(m.cfg.ClaudeDir)
+		return ArchivedSessionsLoadedMsg{
+			Sessions: sessions,
+			Projects: projects,
+			Err:      err,
+		}
+	}
+}
+
+func (m Model) restoreSessionCmd(s session.Session) tea.Cmd {
+	return func() tea.Msg {
+		err := session.Restore(s)
+		return SessionRestoredMsg{SessionID: s.SessionID, Err: err}
 	}
 }
 

@@ -60,6 +60,19 @@ type RunningSessionsMsg struct {
 	RunningIDs map[string]bool
 }
 
+// ArchivedSessionsLoadedMsg is sent when archived sessions are loaded.
+type ArchivedSessionsLoadedMsg struct {
+	Sessions []session.Session
+	Projects []session.Project
+	Err      error
+}
+
+// SessionRestoredMsg is sent after restoring a session from archive.
+type SessionRestoredMsg struct {
+	SessionID string
+	Err       error
+}
+
 // ParsedMessage represents a single message from JSONL.
 type ParsedMessage struct {
 	Type    string // "user", "assistant", "summary"
@@ -73,6 +86,7 @@ const (
 	ConfirmNone ConfirmAction = iota
 	ConfirmDelete
 	ConfirmArchive
+	ConfirmRestore
 )
 
 // DialogResultMsg is sent when a dialog is dismissed.

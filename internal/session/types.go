@@ -19,6 +19,7 @@ type Session struct {
 	// Runtime fields (not from JSON)
 	ProjectName string `json:"-"`
 	IsRunning   bool   `json:"-"`
+	IsArchived  bool   `json:"-"`
 	Selected    bool   `json:"-"`
 }
 

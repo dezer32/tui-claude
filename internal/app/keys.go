@@ -17,8 +17,9 @@ type KeyMap struct {
 	Space     key.Binding
 	Export    key.Binding
 	Archive   key.Binding
-	ToggleAll key.Binding
-	Help      key.Binding
+	ToggleAll      key.Binding
+	ToggleArchive  key.Binding
+	Help           key.Binding
 	Stats     key.Binding
 	Refresh   key.Binding
 	Quit      key.Binding
@@ -85,6 +86,10 @@ func DefaultKeyMap() KeyMap {
 		ToggleAll: key.NewBinding(
 			key.WithKeys("a"),
 			key.WithHelp("a", "toggle all/current dir"),
+		),
+		ToggleArchive: key.NewBinding(
+			key.WithKeys("V"),
+			key.WithHelp("V", "view archived"),
 		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),

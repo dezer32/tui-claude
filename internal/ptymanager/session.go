@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sync"
 
+	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
 
@@ -80,6 +81,7 @@ type ManagedSession struct {
 	ptmx        *os.File
 	mu          sync.Mutex
 	buf         *RingBuffer
+	emu         *vt.SafeEmulator
 	done        chan struct{}
 	exitErr     error
 
@@ -96,6 +98,7 @@ func NewManagedSession(sessionID, projectPath string, bufSize int) *ManagedSessi
 		SessionID:   sessionID,
 		ProjectPath: projectPath,
 		buf:         NewRingBuffer(bufSize),
+		emu:         vt.NewSafeEmulator(120, 40),
 		done:        make(chan struct{}),
 	}
 }
@@ -148,6 +151,7 @@ func (s *ManagedSession) startReader() {
 			n, err := s.ptmx.Read(buf)
 			if n > 0 {
 				s.buf.Write(buf[:n])
+				s.emu.Write(buf[:n])
 
 				s.forwardMu.Lock()
 				if s.forwardW != nil {
@@ -174,10 +178,15 @@ func (s *ManagedSession) SetForward(w io.Writer) {
 	s.forwardW = w
 }
 
-// CaptureOutput returns the current ring buffer contents as a string
-// with ANSI escape sequences stripped.
+// CaptureOutput returns the VT emulator render — a string with proper
+// SGR codes (colors, bold) reconstructed from the virtual terminal state.
 func (s *ManagedSession) CaptureOutput() string {
-	return stripANSI(string(s.buf.Read()))
+	return s.emu.Render()
+}
+
+// ResizeEmulator updates the VT emulator dimensions.
+func (s *ManagedSession) ResizeEmulator(w, h int) {
+	s.emu.Resize(w, h)
 }
 
 // IsRunning returns true if the process is still alive.
