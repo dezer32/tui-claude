@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/vladislav-k/tui-claude/internal/app"
@@ -13,12 +14,21 @@ import (
 
 func main() {
 	claudeDir := flag.String("dir", "", "Claude projects directory (default: ~/.claude/projects)")
+	allMode := flag.Bool("all", false, "Show all sessions across all projects")
 	flag.Parse()
 
 	cfg := config.DefaultConfig()
 	if *claudeDir != "" {
 		cfg.ClaudeDir = *claudeDir
 	}
+	if wd, err := os.Getwd(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(wd); err == nil {
+			cfg.WorkDir = filepath.Clean(resolved)
+		} else {
+			cfg.WorkDir = filepath.Clean(wd)
+		}
+	}
+	cfg.AllMode = *allMode
 
 	mgr := ptymanager.NewManager(cfg.PTYBufferSize)
 	defer mgr.StopAll()

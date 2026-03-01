@@ -13,6 +13,8 @@ type Config struct {
 	MaxJSONLSize   int64 // max JSONL file size to parse (bytes)
 	MaxMessages    int   // max messages to show in preview
 	PTYBufferSize  int   // ring buffer size for PTY capture (bytes)
+	WorkDir        string // current working directory (empty = all sessions)
+	AllMode        bool   // show all sessions across all projects
 }
 
 // DefaultConfig returns config with sensible defaults.

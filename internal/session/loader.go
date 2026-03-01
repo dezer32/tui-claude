@@ -120,6 +120,25 @@ func SortSessions(sessions []Session, field SortField) {
 	}
 }
 
+// FilterByWorkDir returns sessions matching the given working directory.
+// Resolves symlinks for robust comparison on macOS.
+func FilterByWorkDir(sessions []Session, workDir string) []Session {
+	var filtered []Session
+	for _, s := range sessions {
+		if cleanPath(s.ProjectPath) == workDir {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
+}
+
+func cleanPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(p)
+}
+
 // FilterByProject returns sessions matching the given project path.
 func FilterByProject(sessions []Session, projectPath string) []Session {
 	if projectPath == "" {

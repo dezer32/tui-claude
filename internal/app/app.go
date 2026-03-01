@@ -53,6 +53,7 @@ type Model struct {
 
 	// Tab state
 	activeTab    int // 0 = All, 1+ = project index
+	allMode      bool // true = show all sessions, false = current dir only
 	previewMode  PreviewMode
 
 	// Dialog state
@@ -102,6 +103,7 @@ func NewModel(cfg config.Config, ptyMgr *ptymanager.Manager) Model {
 		keys:        DefaultKeyMap(),
 		state:       StateNormal,
 		ptyMgr:      ptyMgr,
+		allMode:     cfg.AllMode,
 		runningIDs:  make(map[string]bool),
 		list:        l,
 		preview:     vp,
@@ -314,15 +316,21 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, m.keys.ToggleAll):
+		m.allMode = !m.allMode
+		m.activeTab = 0
+		m.applyFilters()
+		return m, nil
+
 	case key.Matches(msg, m.keys.TabLeft):
-		if m.activeTab > 0 {
+		if m.allMode && m.activeTab > 0 {
 			m.activeTab--
 			m.applyFilters()
 		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.TabRight):
-		if m.activeTab < len(m.projects) {
+		if m.allMode && m.activeTab < len(m.projects) {
 			m.activeTab++
 			m.applyFilters()
 		}
@@ -497,8 +505,13 @@ func (m *Model) updateLayout() {
 func (m *Model) applyFilters() {
 	filtered := m.allSessions
 
-	// Tab filter
-	if m.activeTab > 0 && m.activeTab <= len(m.projects) {
+	// WorkDir filter (current directory mode)
+	if !m.allMode && m.cfg.WorkDir != "" {
+		filtered = session.FilterByWorkDir(filtered, m.cfg.WorkDir)
+	}
+
+	// Tab filter (only in allMode)
+	if m.allMode && m.activeTab > 0 && m.activeTab <= len(m.projects) {
 		filtered = session.FilterByProject(filtered, m.projects[m.activeTab-1].Path)
 	}
 
@@ -595,6 +608,17 @@ func uitoa(i int) string {
 // Render methods
 
 func (m Model) renderTabBar() string {
+	title := Styles.Title.Render("tui-claude")
+
+	if !m.allMode {
+		// Current directory mode: show project name
+		dirName := filepath.Base(m.cfg.WorkDir)
+		dirLabel := Styles.TabActive.Render("@ " + dirName)
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", dirLabel)
+		return Styles.TabBar.Width(m.width).Render(bar)
+	}
+
+	// All mode: show project tabs
 	tabs := []string{"All"}
 	for _, p := range m.projects {
 		tabs = append(tabs, p.Name)
@@ -609,15 +633,19 @@ func (m Model) renderTabBar() string {
 		}
 	}
 
-	title := Styles.Title.Render("tui-claude")
 	tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-
 	bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", tabLine)
 	return Styles.TabBar.Width(m.width).Render(bar)
 }
 
 func (m Model) renderContent() string {
 	listView := m.list.View()
+
+	// Show hint when no sessions in current dir mode
+	if !m.allMode && len(m.sessions) == 0 && len(m.allSessions) > 0 {
+		hint := Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
+		listView = lipgloss.Place(m.width*2/5, m.height-4, lipgloss.Center, lipgloss.Center, hint)
+	}
 
 	if !m.cfg.PreviewEnabled {
 		return listView
@@ -650,8 +678,13 @@ func (m Model) renderStatusBar() string {
 	projectCount := itoa(len(m.projects))
 	sort := m.sortField.String()
 
-	left := sessionCount + " sessions | " + projectCount + " projects | Sort: " + sort
-	right := "q:quit /:search ?:help"
+	mode := "Current dir"
+	if m.allMode {
+		mode = "All projects"
+	}
+
+	left := sessionCount + " sessions | " + projectCount + " projects | Sort: " + sort + " | " + mode
+	right := "q:quit /:search a:toggle ?:help"
 
 	if m.lastError != "" {
 		left = Styles.Error.Render("Error: " + m.lastError)
@@ -708,10 +741,12 @@ func (m Model) renderHelp() string {
 		{"r", "Rename (edit summary)"},
 		{"/", "Search sessions"},
 		{"s", "Cycle sort (date/project/messages)"},
+		{"a", "Toggle all projects / current dir"},
 		{"Tab", "Switch preview mode"},
 		{"Space", "Multi-select"},
 		{"e", "Export to markdown"},
-		{"h/l", "Switch project tabs"},
+		{"A", "Archive session"},
+		{"h/l", "Switch project tabs (all mode)"},
 		{"?", "This help"},
 		{"S", "Statistics"},
 		{"R", "Refresh list"},
