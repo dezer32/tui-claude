@@ -66,6 +66,8 @@ var Styles = struct {
 	Dialog        lipgloss.Style
 	DialogTitle   lipgloss.Style
 	Error         lipgloss.Style
+	ActiveBadge   lipgloss.Style
+	InactiveBadge lipgloss.Style
 	ArchiveBadge  lipgloss.Style
 	PanelBorder   lipgloss.Style
 	PanelTitle    lipgloss.Style
@@ -206,6 +208,18 @@ var Styles = struct {
 
 	Error: lipgloss.NewStyle().
 		Foreground(ColorWarning),
+
+	ActiveBadge: lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#000000")).
+		Background(ColorGreen).
+		Bold(true).
+		Padding(0, 1),
+
+	InactiveBadge: lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#000000")).
+		Background(lipgloss.Color("#6E6E7E")).
+		Bold(true).
+		Padding(0, 1),
 
 	ArchiveBadge: lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#000000")).

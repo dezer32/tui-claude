@@ -121,3 +121,29 @@ func (p PreviewMode) String() string {
 func (p PreviewMode) Next() PreviewMode {
 	return (p + 1) % 3
 }
+
+// SessionFilter defines the session list filter modes.
+type SessionFilter int
+
+const (
+	FilterActive   SessionFilter = iota
+	FilterInactive
+	FilterArchived
+)
+
+func (f SessionFilter) Next() SessionFilter {
+	return (f + 1) % 3
+}
+
+func (f SessionFilter) String() string {
+	switch f {
+	case FilterActive:
+		return "Active"
+	case FilterInactive:
+		return "Inactive"
+	case FilterArchived:
+		return "Archived"
+	default:
+		return "Active"
+	}
+}

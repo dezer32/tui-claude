@@ -55,9 +55,9 @@ type Model struct {
 
 	// Tab state
 	activeTab    int // 0 = All, 1+ = project index
-	allMode      bool // true = show all sessions, false = current dir only
-	archiveMode  bool // true = viewing archived sessions
-	previewMode  PreviewMode
+	allMode       bool          // true = show all sessions, false = current dir only
+	sessionFilter SessionFilter // Active / Inactive / Archived
+	previewMode   PreviewMode
 
 	// Archived sessions
 	archivedSessions []session.Session
@@ -174,6 +174,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.allSessions = msg.Sessions
 		m.projects = msg.Projects
+		m.rekeyNewSessions()
 		m.applyFilters()
 		return m, nil
 
@@ -213,7 +214,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.lastError = msg.Err.Error()
 		} else {
-			if m.archiveMode {
+			if m.sessionFilter == FilterArchived {
 				m.removeArchivedSession(msg.SessionID)
 			} else {
 				m.removeSession(msg.SessionID)
@@ -226,7 +227,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.lastError = msg.Err.Error()
 		}
-		return m, nil
+		// Reload sessions from disk so newly created sessions appear in the list
+		return m, tea.Batch(
+			loadSessionsCmd(m.cfg.ClaudeDir),
+			m.detectRunningCmd(),
+		)
 
 	case SessionExportedMsg:
 		if msg.Err != nil {
@@ -356,9 +361,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.ToggleArchive):
-		m.archiveMode = !m.archiveMode
+		m.sessionFilter = m.sessionFilter.Next()
 		m.activeTab = 0
-		if m.archiveMode && len(m.archivedSessions) == 0 {
+		if m.sessionFilter == FilterArchived && len(m.archivedSessions) == 0 {
 			m.applyFilters()
 			return m, m.loadArchivedSessionsCmd()
 		}
@@ -366,7 +371,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Refresh):
-		if m.archiveMode {
+		if m.sessionFilter == FilterArchived {
 			return m, tea.Batch(
 				loadSessionsCmd(m.cfg.ClaudeDir),
 				m.loadArchivedSessionsCmd(),
@@ -417,7 +422,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Rename):
-		if m.archiveMode {
+		if m.sessionFilter == FilterArchived {
 			return m, nil
 		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
@@ -430,7 +435,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Enter):
-		if m.archiveMode {
+		if m.sessionFilter == FilterArchived {
 			return m, nil
 		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
@@ -445,14 +450,14 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.New):
-		if m.archiveMode {
+		if m.sessionFilter == FilterArchived {
 			return m, nil
 		}
 		return m, m.newSessionCmd()
 
 	case key.Matches(msg, m.keys.Archive):
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
-			if m.archiveMode {
+			if m.sessionFilter == FilterArchived {
 				// In archive mode, A = restore
 				m.state = StateConfirmDialog
 				m.confirmAction = ConfirmRestore
@@ -593,12 +598,30 @@ func (m *Model) applyFilters() {
 	var filtered []session.Session
 	var activeProjects []session.Project
 
-	if m.archiveMode {
+	switch m.sessionFilter {
+	case FilterActive:
+		// Only sessions with a running PTY process
+		var active []session.Session
+		for _, s := range m.allSessions {
+			if m.runningIDs[s.SessionID] {
+				active = append(active, s)
+			}
+		}
+		filtered = active
+		activeProjects = m.projects
+	case FilterInactive:
+		// Non-archived sessions without a running process
+		var inactive []session.Session
+		for _, s := range m.allSessions {
+			if !m.runningIDs[s.SessionID] {
+				inactive = append(inactive, s)
+			}
+		}
+		filtered = inactive
+		activeProjects = m.projects
+	case FilterArchived:
 		filtered = m.archivedSessions
 		activeProjects = m.archivedProjects
-	} else {
-		filtered = m.allSessions
-		activeProjects = m.projects
 	}
 
 	// WorkDir filter (current directory mode)
@@ -619,7 +642,7 @@ func (m *Model) applyFilters() {
 	// Update list items
 	items := make([]list.Item, len(filtered))
 	for i, s := range filtered {
-		if !m.archiveMode {
+		if m.sessionFilter != FilterArchived {
 			s.IsRunning = m.runningIDs[s.SessionID]
 		}
 		items[i] = sessionItem{session: s}
@@ -664,6 +687,38 @@ func (m *Model) removeArchivedSession(id string) {
 	}
 	m.archivedSessions = remaining
 	m.applyFilters()
+}
+
+// rekeyNewSessions matches PTY sessions with synthetic "new-*" IDs
+// to real session UUIDs loaded from disk, so they appear correctly
+// in the Active filter.
+func (m *Model) rekeyNewSessions() {
+	pending := m.ptyMgr.RunningNewSessions()
+	if len(pending) == 0 {
+		return
+	}
+
+	for newID, projPath := range pending {
+		// Find the newest disk session matching this project path
+		// that isn't already tracked by the PTY manager under a real ID
+		var bestID string
+		var bestTime time.Time
+		for _, s := range m.allSessions {
+			if s.ProjectPath != projPath {
+				continue
+			}
+			if m.ptyMgr.IsRunning(s.SessionID) {
+				continue // already tracked under real ID
+			}
+			if s.Modified.After(bestTime) {
+				bestTime = s.Modified
+				bestID = s.SessionID
+			}
+		}
+		if bestID != "" {
+			m.ptyMgr.RekeySession(newID, bestID)
+		}
+	}
 }
 
 func (m *Model) updateSessionSummary(id, summary string) {
@@ -720,39 +775,35 @@ func (m Model) renderTabBar() string {
 	titleIcon := Styles.PanelTitle.Render("◆")
 	title := Styles.Title.Render("tui-claude")
 
-	if m.archiveMode {
-		badge := Styles.ArchiveBadge.Render("ARCHIVED")
-		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge)
+	// Filter badge
+	var badge string
+	switch m.sessionFilter {
+	case FilterActive:
+		badge = Styles.ActiveBadge.Render("ACTIVE")
+	case FilterInactive:
+		badge = Styles.InactiveBadge.Render("INACTIVE")
+	case FilterArchived:
+		badge = Styles.ArchiveBadge.Render("ARCHIVED")
+	}
 
-		if m.allMode {
-			tabs := []string{"All"}
-			for _, p := range m.archivedProjects {
-				tabs = append(tabs, p.Name)
-			}
-			var rendered []string
-			for i, t := range tabs {
-				if i == m.activeTab {
-					rendered = append(rendered, Styles.TabActive.Render(t))
-				} else {
-					rendered = append(rendered, Styles.TabInactive.Render(t))
-				}
-			}
-			tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-			bar = lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge, "  ", tabLine)
-		}
-
-		return Styles.TabBar.Width(m.width).Render(bar)
+	// Determine project list for tabs
+	var tabProjects []session.Project
+	switch m.sessionFilter {
+	case FilterArchived:
+		tabProjects = m.archivedProjects
+	default:
+		tabProjects = m.projects
 	}
 
 	if !m.allMode {
 		dirName := filepath.Base(m.cfg.WorkDir)
 		dirLabel := Styles.TabActive.Render("@ " + dirName)
-		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", dirLabel)
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge, "  ", dirLabel)
 		return Styles.TabBar.Width(m.width).Render(bar)
 	}
 
 	tabs := []string{"All"}
-	for _, p := range m.projects {
+	for _, p := range tabProjects {
 		tabs = append(tabs, p.Name)
 	}
 
@@ -766,7 +817,7 @@ func (m Model) renderTabBar() string {
 	}
 
 	tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-	bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", tabLine)
+	bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge, "  ", tabLine)
 	return Styles.TabBar.Width(m.width).Render(bar)
 }
 
@@ -782,9 +833,15 @@ func (m Model) renderContent() string {
 	// Show hint when no sessions
 	if len(m.sessions) == 0 {
 		var hint string
-		if m.archiveMode {
-			hint = Styles.HelpDesc.Render("No archived sessions.\nPress " + Styles.HelpKey.Render("V") + " to go back.")
-		} else if !m.allMode && len(m.allSessions) > 0 {
+		switch m.sessionFilter {
+		case FilterActive:
+			hint = Styles.HelpDesc.Render("No running sessions.\nPress " + Styles.HelpKey.Render("V") + " for inactive.")
+		case FilterInactive:
+			hint = Styles.HelpDesc.Render("No inactive sessions.\nPress " + Styles.HelpKey.Render("V") + " for archived.")
+		case FilterArchived:
+			hint = Styles.HelpDesc.Render("No archived sessions.\nPress " + Styles.HelpKey.Render("V") + " for active.")
+		}
+		if !m.allMode && len(m.allSessions) > 0 && hint == "" {
 			hint = Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
 		}
 		if hint != "" {
@@ -901,7 +958,7 @@ func (m Model) renderStatusBar() string {
 	sort := m.sortField.String()
 
 	var projectCount string
-	if m.archiveMode {
+	if m.sessionFilter == FilterArchived {
 		projectCount = itoa(len(m.archivedProjects))
 	} else {
 		projectCount = itoa(len(m.projects))
@@ -918,18 +975,29 @@ func (m Model) renderStatusBar() string {
 		Styles.StatusVal.Render(projectCount) + " projects" + sep +
 		"Sort: " + Styles.StatusVal.Render(sort) + sep + mode
 
-	var right string
-	if m.archiveMode {
+	// Badge on the left
+	switch m.sessionFilter {
+	case FilterActive:
+		left = Styles.ActiveBadge.Render("ACTIVE") + "  " + left
+	case FilterInactive:
+		left = Styles.InactiveBadge.Render("INACTIVE") + "  " + left
+	case FilterArchived:
 		left = Styles.ArchiveBadge.Render("ARCHIVED") + "  " + left
+	}
+
+	// Key hints on the right — adapt to mode
+	var right string
+	if m.sessionFilter == FilterArchived {
 		right = renderKeyHint("A", "restore") + sep +
 			renderKeyHint("d", "delete") + sep +
 			renderKeyHint("e", "export") + sep +
-			renderKeyHint("V", "back") + sep +
+			renderKeyHint("V", "next") + sep +
 			renderKeyHint("?", "help")
 	} else {
 		right = renderKeyHint("q", "quit") + sep +
 			renderKeyHint("/", "search") + sep +
 			renderKeyHint("a", "toggle") + sep +
+			renderKeyHint("V", "next") + sep +
 			renderKeyHint("?", "help")
 	}
 
@@ -984,7 +1052,7 @@ func (m Model) renderSearchOverlay(base string) string {
 func (m Model) renderHelp() string {
 	var bindings []struct{ key, desc string }
 
-	if m.archiveMode {
+	if m.sessionFilter == FilterArchived {
 		bindings = []struct{ key, desc string }{
 			{"↑/k, ↓/j", "Navigate list"},
 			{"A", "Restore session"},
@@ -995,7 +1063,7 @@ func (m Model) renderHelp() string {
 			{"a", "Toggle all projects / current dir"},
 			{"Tab", "Switch preview mode"},
 			{"h/l", "Switch project tabs (all mode)"},
-			{"V", "Back to active sessions"},
+			{"V", "Cycle filter (active/inactive/archived)"},
 			{"?", "This help"},
 			{"R", "Refresh list"},
 			{"q", "Quit"},
@@ -1014,7 +1082,7 @@ func (m Model) renderHelp() string {
 			{"Space", "Multi-select"},
 			{"e", "Export to markdown"},
 			{"A", "Archive session"},
-			{"V", "View archived sessions"},
+			{"V", "Cycle filter (active/inactive/archived)"},
 			{"h/l", "Switch project tabs (all mode)"},
 			{"?", "This help"},
 			{"S", "Statistics"},
@@ -1180,13 +1248,16 @@ func (m Model) resumeSessionCmd(s session.Session) tea.Cmd {
 }
 
 func (m Model) newSessionCmd() tea.Cmd {
+	dir := m.cfg.WorkDir
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	}
 	return func() tea.Msg {
-		home, _ := os.UserHomeDir()
 		sessionID := fmt.Sprintf("new-%d", time.Now().UnixNano())
-		if err := m.ptyMgr.LaunchNew(sessionID, home); err != nil {
+		if err := m.ptyMgr.LaunchNew(sessionID, dir); err != nil {
 			return SessionResumedMsg{Err: err}
 		}
-		return attachMsg{session: session.Session{SessionID: sessionID, ProjectPath: home}}
+		return attachMsg{session: session.Session{SessionID: sessionID, ProjectPath: dir}}
 	}
 }
 

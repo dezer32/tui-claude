@@ -89,7 +89,7 @@ func DefaultKeyMap() KeyMap {
 		),
 		ToggleArchive: key.NewBinding(
 			key.WithKeys("V"),
-			key.WithHelp("V", "view archived"),
+			key.WithHelp("V", "cycle filter"),
 		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),

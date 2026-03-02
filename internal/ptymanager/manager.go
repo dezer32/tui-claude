@@ -138,6 +138,37 @@ func (m *Manager) ResizeEmulator(sessionID string, w, h int) {
 	}
 }
 
+// RekeySession changes the key under which a session is tracked.
+// Used to replace synthetic "new-*" IDs with real session UUIDs from disk.
+func (m *Manager) RekeySession(oldID, newID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[oldID]
+	if !ok {
+		return false
+	}
+	s.SessionID = newID
+	m.sessions[newID] = s
+	delete(m.sessions, oldID)
+	return true
+}
+
+// RunningNewSessions returns running sessions with synthetic "new-" prefix IDs
+// mapped to their project paths. Used to match them to real disk sessions.
+func (m *Manager) RunningNewSessions() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string]string)
+	for id, s := range m.sessions {
+		if len(id) > 4 && id[:4] == "new-" && s.IsRunning() {
+			result[id] = s.ProjectPath
+		}
+	}
+	return result
+}
+
 // Remove removes a finished session from the manager.
 func (m *Manager) Remove(sessionID string) {
 	m.mu.Lock()
