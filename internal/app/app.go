@@ -2,8 +2,10 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -11,10 +13,11 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/vladislav-k/tui-claude/internal/config"
+	"github.com/vladislav-k/tui-claude/internal/ptymanager"
 	"github.com/vladislav-k/tui-claude/internal/session"
-	"github.com/vladislav-k/tui-claude/internal/tmux"
 )
 
 // State represents the current UI state.
@@ -31,12 +34,12 @@ const (
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	cfg     config.Config
-	keys    KeyMap
-	state   State
-	width   int
-	height  int
-	hasTmux bool
+	cfg    config.Config
+	keys   KeyMap
+	state  State
+	width  int
+	height int
+	ptyMgr *ptymanager.Manager
 
 	// Data
 	allSessions []session.Session
@@ -52,7 +55,13 @@ type Model struct {
 
 	// Tab state
 	activeTab    int // 0 = All, 1+ = project index
+	allMode      bool // true = show all sessions, false = current dir only
+	archiveMode  bool // true = viewing archived sessions
 	previewMode  PreviewMode
+
+	// Archived sessions
+	archivedSessions []session.Session
+	archivedProjects []session.Project
 
 	// Dialog state
 	confirmAction ConfirmAction
@@ -67,25 +76,37 @@ type Model struct {
 }
 
 // NewModel creates a new app model.
-func NewModel(cfg config.Config) Model {
+func NewModel(cfg config.Config, ptyMgr *ptymanager.Manager) Model {
 	// Search input
 	si := textinput.New()
 	si.Placeholder = "Search sessions..."
 	si.Prompt = "/ "
+	si.PromptStyle = lipgloss.NewStyle().Foreground(ColorCyan)
+	si.TextStyle = lipgloss.NewStyle().Foreground(ColorTextBright)
 
 	// Rename input
 	ri := textinput.New()
 	ri.Placeholder = "New summary..."
 	ri.Prompt = "> "
+	ri.PromptStyle = lipgloss.NewStyle().Foreground(ColorCyan)
+	ri.TextStyle = lipgloss.NewStyle().Foreground(ColorTextBright)
 
 	// List delegate
 	delegate := list.NewDefaultDelegate()
 	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.
-		Foreground(ColorWhite).
-		BorderLeftForeground(ColorPrimary)
+		Foreground(ColorCyan).
+		BorderLeftForeground(ColorCyan)
 	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
-		Foreground(ColorSecondary).
-		BorderLeftForeground(ColorPrimary)
+		Foreground(ColorTextNormal).
+		BorderLeftForeground(ColorCyan)
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.
+		Foreground(ColorTextBright)
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.
+		Foreground(ColorTextMuted)
+	delegate.Styles.DimmedTitle = delegate.Styles.DimmedTitle.
+		Foreground(ColorTextMuted)
+	delegate.Styles.DimmedDesc = delegate.Styles.DimmedDesc.
+		Foreground(ColorTextMuted)
 
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "Sessions"
@@ -100,7 +121,8 @@ func NewModel(cfg config.Config) Model {
 		cfg:         cfg,
 		keys:        DefaultKeyMap(),
 		state:       StateNormal,
-		hasTmux:     config.HasTmux(),
+		ptyMgr:      ptyMgr,
+		allMode:     cfg.AllMode,
 		runningIDs:  make(map[string]bool),
 		list:        l,
 		preview:     vp,
@@ -112,14 +134,11 @@ func NewModel(cfg config.Config) Model {
 
 // Init starts the program by loading sessions.
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{
+	return tea.Batch(
 		loadSessionsCmd(m.cfg.ClaudeDir),
-		tickCmd(2 * time.Second),
-	}
-	if m.hasTmux {
-		cmds = append(cmds, detectRunningCmd())
-	}
-	return tea.Batch(cmds...)
+		tickCmd(2*time.Second),
+		m.detectRunningCmd(),
+	)
 }
 
 func loadSessionsCmd(claudeDir string) tea.Cmd {
@@ -142,6 +161,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.updateLayout()
+		// Sync VT emulator size with preview viewport for running sessions
+		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
+			m.ptyMgr.ResizeEmulator(sel.session.SessionID, m.preview.Width, m.preview.Height)
+		}
 		return m, nil
 
 	case SessionsLoadedMsg:
@@ -155,12 +178,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case RunningSessionsMsg:
-		// Match short IDs to full session IDs
-		var sessionIDs []string
-		for _, s := range m.allSessions {
-			sessionIDs = append(sessionIDs, s.SessionID)
-		}
-		m.runningIDs = tmux.MatchRunning(msg.RunningIDs, sessionIDs)
+		m.runningIDs = msg.RunningIDs
 		m.applyFilters()
 		return m, nil
 
@@ -169,18 +187,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previewContent = "Could not parse session data"
 		} else {
 			m.previewSession = msg.SessionID
-			m.previewContent = renderMessages(msg.Messages)
+			m.previewContent = renderMessages(msg.Messages, m.preview.Width)
 		}
 		m.preview.SetContent(m.previewContent)
 		m.preview.GotoTop()
 		return m, nil
 
 	case LiveCaptureMsg:
-		if msg.Err == nil {
-			m.previewContent = msg.Content
-			m.preview.SetContent(m.previewContent)
-		}
+		m.previewContent = msg.Content
+		m.preview.SetContent(m.previewContent)
 		return m, nil
+
+	case attachMsg:
+		return m, tea.Exec(
+			&attachExecCmd{mgr: m.ptyMgr, sessionID: msg.session.SessionID},
+			func(err error) tea.Msg {
+				return SessionResumedMsg{Session: msg.session, Err: err}
+			},
+		)
 
 	case DialogResultMsg:
 		return m.handleDialogResult(msg)
@@ -189,7 +213,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.lastError = msg.Err.Error()
 		} else {
-			m.removeSession(msg.SessionID)
+			if m.archiveMode {
+				m.removeArchivedSession(msg.SessionID)
+			} else {
+				m.removeSession(msg.SessionID)
+			}
 		}
 		m.state = StateNormal
 		return m, nil
@@ -208,6 +236,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case ArchivedSessionsLoadedMsg:
+		if msg.Err != nil {
+			m.lastError = msg.Err.Error()
+			return m, nil
+		}
+		m.archivedSessions = msg.Sessions
+		m.archivedProjects = msg.Projects
+		m.applyFilters()
+		return m, nil
+
+	case SessionRestoredMsg:
+		if msg.Err != nil {
+			m.lastError = msg.Err.Error()
+		} else {
+			// Reload both collections
+			return m, tea.Batch(
+				loadSessionsCmd(m.cfg.ClaudeDir),
+				m.loadArchivedSessionsCmd(),
+			)
+		}
+		return m, nil
+
 	case SessionRenamedMsg:
 		if msg.Err != nil {
 			m.lastError = msg.Err.Error()
@@ -219,16 +269,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// Periodic refresh: detect running sessions, refresh live preview
-		var cmds []tea.Cmd
-		if m.hasTmux {
-			cmds = append(cmds, detectRunningCmd())
+		cmds := []tea.Cmd{
+			m.detectRunningCmd(),
+			tickCmd(2 * time.Second),
 		}
 		if m.previewMode == PreviewLive {
 			if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 				cmds = append(cmds, m.liveCaptureCmd(sel.session))
 			}
 		}
-		cmds = append(cmds, tickCmd(2*time.Second))
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
@@ -306,7 +355,23 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.applyFilters()
 		return m, nil
 
+	case key.Matches(msg, m.keys.ToggleArchive):
+		m.archiveMode = !m.archiveMode
+		m.activeTab = 0
+		if m.archiveMode && len(m.archivedSessions) == 0 {
+			m.applyFilters()
+			return m, m.loadArchivedSessionsCmd()
+		}
+		m.applyFilters()
+		return m, nil
+
 	case key.Matches(msg, m.keys.Refresh):
+		if m.archiveMode {
+			return m, tea.Batch(
+				loadSessionsCmd(m.cfg.ClaudeDir),
+				m.loadArchivedSessionsCmd(),
+			)
+		}
 		return m, loadSessionsCmd(m.cfg.ClaudeDir)
 
 	case key.Matches(msg, m.keys.TabSwitch):
@@ -316,15 +381,21 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, m.keys.ToggleAll):
+		m.allMode = !m.allMode
+		m.activeTab = 0
+		m.applyFilters()
+		return m, nil
+
 	case key.Matches(msg, m.keys.TabLeft):
-		if m.activeTab > 0 {
+		if m.allMode && m.activeTab > 0 {
 			m.activeTab--
 			m.applyFilters()
 		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.TabRight):
-		if m.activeTab < len(m.projects) {
+		if m.allMode && m.activeTab < len(m.projects) {
 			m.activeTab++
 			m.applyFilters()
 		}
@@ -346,6 +417,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Rename):
+		if m.archiveMode {
+			return m, nil
+		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 			m.state = StateRenameDialog
 			m.renameInput.Reset()
@@ -356,6 +430,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Enter):
+		if m.archiveMode {
+			return m, nil
+		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 			return m, m.resumeSessionCmd(sel.session)
 		}
@@ -368,12 +445,21 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.New):
+		if m.archiveMode {
+			return m, nil
+		}
 		return m, m.newSessionCmd()
 
 	case key.Matches(msg, m.keys.Archive):
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
-			m.state = StateConfirmDialog
-			m.confirmAction = ConfirmArchive
+			if m.archiveMode {
+				// In archive mode, A = restore
+				m.state = StateConfirmDialog
+				m.confirmAction = ConfirmRestore
+			} else {
+				m.state = StateConfirmDialog
+				m.confirmAction = ConfirmArchive
+			}
 			_ = sel
 		}
 		return m, nil
@@ -433,6 +519,8 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.deleteSessionCmd(sel.session)
 			case ConfirmArchive:
 				return m, m.archiveSessionCmd(sel.session)
+			case ConfirmRestore:
+				return m, m.restoreSessionCmd(sel.session)
 			}
 		}
 		m.state = StateNormal
@@ -484,24 +572,43 @@ func (m Model) View() string {
 func (m *Model) updateLayout() {
 	tabBarHeight := 1
 	statusBarHeight := 1
-	contentHeight := m.height - tabBarHeight - statusBarHeight - 2 // borders
+	contentHeight := m.height - tabBarHeight - statusBarHeight
 
 	listWidth := m.width * 2 / 5
 	if !m.cfg.PreviewEnabled {
 		listWidth = m.width
 	}
 
-	m.list.SetSize(listWidth, contentHeight)
-	m.preview.Width = m.width - listWidth - 3 // border + padding
-	m.preview.Height = contentHeight
+	previewWidth := m.width - listWidth
+
+	// List: subtract panel borders (2 left+right) for inner content
+	m.list.SetSize(listWidth-2, contentHeight-2)
+	// Preview: subtract panel borders (2) + inner padding (2)
+	m.preview.Width = previewWidth - 2 - 2
+	// Preview: subtract top+bottom borders, title is in the top border
+	m.preview.Height = contentHeight - 2
 }
 
 func (m *Model) applyFilters() {
-	filtered := m.allSessions
+	var filtered []session.Session
+	var activeProjects []session.Project
 
-	// Tab filter
-	if m.activeTab > 0 && m.activeTab <= len(m.projects) {
-		filtered = session.FilterByProject(filtered, m.projects[m.activeTab-1].Path)
+	if m.archiveMode {
+		filtered = m.archivedSessions
+		activeProjects = m.archivedProjects
+	} else {
+		filtered = m.allSessions
+		activeProjects = m.projects
+	}
+
+	// WorkDir filter (current directory mode)
+	if !m.allMode && m.cfg.WorkDir != "" {
+		filtered = session.FilterByWorkDir(filtered, m.cfg.WorkDir)
+	}
+
+	// Tab filter (only in allMode)
+	if m.allMode && m.activeTab > 0 && m.activeTab <= len(activeProjects) {
+		filtered = session.FilterByProject(filtered, activeProjects[m.activeTab-1].Path)
 	}
 
 	// Sort
@@ -512,7 +619,9 @@ func (m *Model) applyFilters() {
 	// Update list items
 	items := make([]list.Item, len(filtered))
 	for i, s := range filtered {
-		s.IsRunning = m.runningIDs[s.SessionID]
+		if !m.archiveMode {
+			s.IsRunning = m.runningIDs[s.SessionID]
+		}
 		items[i] = sessionItem{session: s}
 	}
 	m.list.SetItems(items)
@@ -546,6 +655,17 @@ func (m *Model) removeSession(id string) {
 	m.applyFilters()
 }
 
+func (m *Model) removeArchivedSession(id string) {
+	var remaining []session.Session
+	for _, s := range m.archivedSessions {
+		if s.SessionID != id {
+			remaining = append(remaining, s)
+		}
+	}
+	m.archivedSessions = remaining
+	m.applyFilters()
+}
+
 func (m *Model) updateSessionSummary(id, summary string) {
 	for i := range m.allSessions {
 		if m.allSessions[i].SessionID == id {
@@ -564,10 +684,10 @@ type sessionItem struct {
 func (i sessionItem) Title() string {
 	prefix := "  "
 	if i.session.IsRunning {
-		prefix = "● "
+		prefix = Styles.RunningDot.Render("●") + " "
 	}
 	if i.session.Selected {
-		prefix = "✓ "
+		prefix = Styles.SelectedMark.Render("▸") + " "
 	}
 	return prefix + i.session.DisplayTitle()
 }
@@ -597,6 +717,40 @@ func uitoa(i int) string {
 // Render methods
 
 func (m Model) renderTabBar() string {
+	titleIcon := Styles.PanelTitle.Render("◆")
+	title := Styles.Title.Render("tui-claude")
+
+	if m.archiveMode {
+		badge := Styles.ArchiveBadge.Render("ARCHIVED")
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge)
+
+		if m.allMode {
+			tabs := []string{"All"}
+			for _, p := range m.archivedProjects {
+				tabs = append(tabs, p.Name)
+			}
+			var rendered []string
+			for i, t := range tabs {
+				if i == m.activeTab {
+					rendered = append(rendered, Styles.TabActive.Render(t))
+				} else {
+					rendered = append(rendered, Styles.TabInactive.Render(t))
+				}
+			}
+			tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
+			bar = lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", badge, "  ", tabLine)
+		}
+
+		return Styles.TabBar.Width(m.width).Render(bar)
+	}
+
+	if !m.allMode {
+		dirName := filepath.Base(m.cfg.WorkDir)
+		dirLabel := Styles.TabActive.Render("@ " + dirName)
+		bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", dirLabel)
+		return Styles.TabBar.Width(m.width).Render(bar)
+	}
+
 	tabs := []string{"All"}
 	for _, p := range m.projects {
 		tabs = append(tabs, p.Name)
@@ -611,78 +765,199 @@ func (m Model) renderTabBar() string {
 		}
 	}
 
-	title := Styles.Title.Render("tui-claude")
 	tabLine := lipgloss.JoinHorizontal(lipgloss.Center, rendered...)
-
-	bar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", tabLine)
+	bar := lipgloss.JoinHorizontal(lipgloss.Center, titleIcon, " ", title, "  ", tabLine)
 	return Styles.TabBar.Width(m.width).Render(bar)
 }
 
 func (m Model) renderContent() string {
+	listWidth := m.width * 2 / 5
+	if !m.cfg.PreviewEnabled {
+		listWidth = m.width
+	}
+	contentHeight := m.height - 2 // tabBar + statusBar
+
 	listView := m.list.View()
 
+	// Show hint when no sessions
+	if len(m.sessions) == 0 {
+		var hint string
+		if m.archiveMode {
+			hint = Styles.HelpDesc.Render("No archived sessions.\nPress " + Styles.HelpKey.Render("V") + " to go back.")
+		} else if !m.allMode && len(m.allSessions) > 0 {
+			hint = Styles.HelpDesc.Render("No sessions for current directory.\nPress " + Styles.HelpKey.Render("a") + " to show all projects.")
+		}
+		if hint != "" {
+			listView = lipgloss.Place(listWidth-2, contentHeight-2, lipgloss.Center, lipgloss.Center, hint)
+		}
+	}
+
+	// List panel title
+	listTitle := "Sessions (" + itoa(len(m.sessions)) + ")"
+	listBorderColor := ColorBorderDim
+	listTitleColor := ColorCyan
+	listPanel := renderTitledPanel(listTitle, listView, listWidth, contentHeight, listBorderColor, listTitleColor)
+
 	if !m.cfg.PreviewEnabled {
-		return listView
+		return listPanel
 	}
 
 	// Preview panel
-	previewTabs := m.renderPreviewTabs()
+	previewWidth := m.width - listWidth
 	previewContent := m.preview.View()
-	previewPanel := lipgloss.JoinVertical(lipgloss.Left, previewTabs, previewContent)
-	previewPanel = Styles.Preview.Height(m.height - 4).Render(previewPanel)
+	previewTitle := m.previewTitleLine()
+	previewBorderColor := ColorBorderDim
+	previewTitleColor := ColorCyan
+	previewPanel := renderTitledPanel(previewTitle, previewContent, previewWidth, contentHeight, previewBorderColor, previewTitleColor)
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, listView, previewPanel)
+	return lipgloss.JoinHorizontal(lipgloss.Top, listPanel, previewPanel)
 }
 
-func (m Model) renderPreviewTabs() string {
+func (m Model) previewTitleLine() string {
 	modes := []PreviewMode{PreviewLive, PreviewMessages, PreviewMeta}
-	var tabs []string
+	var parts []string
 	for _, mode := range modes {
 		if mode == m.previewMode {
-			tabs = append(tabs, Styles.PreviewTabAct.Render("["+mode.String()+"]"))
+			parts = append(parts, Styles.PreviewTabAct.Render(mode.String()))
 		} else {
-			tabs = append(tabs, Styles.PreviewTab.Render("["+mode.String()+"]"))
+			parts = append(parts, Styles.PreviewTab.Render(mode.String()))
 		}
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Left, tabs...)
+	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+}
+
+// renderTitledPanel creates a panel with a title embedded in the top border.
+func renderTitledPanel(title, content string, width, height int, borderColor, titleColor lipgloss.Color) string {
+	if width < 4 {
+		return content
+	}
+
+	innerWidth := width - 2 // left + right border chars
+
+	// Style for border characters
+	borderStyle := lipgloss.NewStyle().Foreground(borderColor)
+	titleStyle := lipgloss.NewStyle().Foreground(titleColor).Bold(true)
+
+	// Top line: ╭─ Title ─────╮
+	titleText := titleStyle.Render(title)
+	titleVisualWidth := lipgloss.Width(titleText)
+	topFillWidth := innerWidth - 2 - titleVisualWidth // 2 = "─ " before title + " " after
+	if topFillWidth < 0 {
+		topFillWidth = 0
+	}
+	topFill := ""
+	for i := 0; i < topFillWidth; i++ {
+		topFill += "─"
+	}
+	topLine := borderStyle.Render("╭─") + " " + titleText + " " + borderStyle.Render(topFill+"╮")
+
+	// Bottom line: ╰──────────╯
+	bottomFill := ""
+	for i := 0; i < innerWidth; i++ {
+		bottomFill += "─"
+	}
+	bottomLine := borderStyle.Render("╰" + bottomFill + "╯")
+
+	// Side borders for content
+	leftBorder := borderStyle.Render("│")
+	rightBorder := borderStyle.Render("│")
+
+	// Wrap content lines with side borders
+	contentLines := strings.Split(content, "\n")
+	innerHeight := height - 2 // top + bottom border
+	if innerHeight < 0 {
+		innerHeight = 0
+	}
+
+	// Pad or truncate content to fill the panel height
+	for len(contentLines) < innerHeight {
+		contentLines = append(contentLines, "")
+	}
+	if len(contentLines) > innerHeight {
+		contentLines = contentLines[:innerHeight]
+	}
+
+	var body strings.Builder
+	for _, line := range contentLines {
+		lineWidth := lipgloss.Width(line)
+		pad := innerWidth - lineWidth
+		if pad < 0 {
+			pad = 0
+		}
+		padding := strings.Repeat(" ", pad)
+		body.WriteString(leftBorder + line + padding + rightBorder + "\n")
+	}
+
+	return topLine + "\n" + body.String() + bottomLine
+}
+
+// renderKeyHint formats a key hint for the status bar.
+func renderKeyHint(key, desc string) string {
+	return Styles.HelpKey.Render(key) + " " + Styles.HelpDesc.Render(desc)
 }
 
 func (m Model) renderStatusBar() string {
 	sessionCount := itoa(len(m.sessions))
-	projectCount := itoa(len(m.projects))
 	sort := m.sortField.String()
 
-	left := sessionCount + " sessions | " + projectCount + " projects | Sort: " + sort
-	right := "q:quit /:search ?:help"
+	var projectCount string
+	if m.archiveMode {
+		projectCount = itoa(len(m.archivedProjects))
+	} else {
+		projectCount = itoa(len(m.projects))
+	}
+
+	mode := "Current dir"
+	if m.allMode {
+		mode = "All"
+	}
+
+	sep := Styles.StatusSep.Render(" │ ")
+
+	left := Styles.StatusVal.Render(sessionCount) + " sessions" + sep +
+		Styles.StatusVal.Render(projectCount) + " projects" + sep +
+		"Sort: " + Styles.StatusVal.Render(sort) + sep + mode
+
+	var right string
+	if m.archiveMode {
+		left = Styles.ArchiveBadge.Render("ARCHIVED") + "  " + left
+		right = renderKeyHint("A", "restore") + sep +
+			renderKeyHint("d", "delete") + sep +
+			renderKeyHint("e", "export") + sep +
+			renderKeyHint("V", "back") + sep +
+			renderKeyHint("?", "help")
+	} else {
+		right = renderKeyHint("q", "quit") + sep +
+			renderKeyHint("/", "search") + sep +
+			renderKeyHint("a", "toggle") + sep +
+			renderKeyHint("?", "help")
+	}
 
 	if m.lastError != "" {
 		left = Styles.Error.Render("Error: " + m.lastError)
 	}
 
-	if !m.hasTmux {
-		right = "[view-only] " + right
-	}
-
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	gap := m.width - leftWidth - rightWidth - 2
 	if gap < 0 {
 		gap = 0
 	}
-	padding := ""
-	for i := 0; i < gap; i++ {
-		padding += " "
-	}
 
-	return Styles.StatusBar.Width(m.width).Render(left + padding + right)
+	return Styles.StatusBar.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
 }
 
 func (m Model) renderConfirmOverlay(base string) string {
 	title := "Delete session?"
-	if m.confirmAction == ConfirmArchive {
+	switch m.confirmAction {
+	case ConfirmArchive:
 		title = "Archive session?"
+	case ConfirmRestore:
+		title = "Restore session from archive?"
 	}
 	dialog := Styles.DialogTitle.Render(title) + "\n\n" +
-		"Press " + Styles.HelpKey.Render("y") + " to confirm, " +
-		Styles.HelpKey.Render("n") + " to cancel"
+		"Press " + Styles.ConfirmYes.Render("y") + " to confirm, " +
+		Styles.ConfirmNo.Render("n") + " to cancel"
 	box := Styles.Dialog.Render(dialog)
 	return placeOverlay(m.width, m.height-2, box, base)
 }
@@ -698,7 +973,8 @@ func (m Model) renderRenameOverlay(base string) string {
 func (m Model) renderSearchOverlay(base string) string {
 	searchBox := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(ColorPrimary).
+		BorderForeground(ColorCyan).
+		Background(ColorBgSurface).
 		Padding(0, 1).
 		Width(40).
 		Render(m.searchInput.View())
@@ -706,22 +982,45 @@ func (m Model) renderSearchOverlay(base string) string {
 }
 
 func (m Model) renderHelp() string {
-	bindings := []struct{ key, desc string }{
-		{"↑/k, ↓/j", "Navigate list"},
-		{"Enter", "Resume session in tmux"},
-		{"n", "New Claude session"},
-		{"d", "Delete session"},
-		{"r", "Rename (edit summary)"},
-		{"/", "Search sessions"},
-		{"s", "Cycle sort (date/project/messages)"},
-		{"Tab", "Switch preview mode"},
-		{"Space", "Multi-select"},
-		{"e", "Export to markdown"},
-		{"h/l", "Switch project tabs"},
-		{"?", "This help"},
-		{"S", "Statistics"},
-		{"R", "Refresh list"},
-		{"q", "Quit"},
+	var bindings []struct{ key, desc string }
+
+	if m.archiveMode {
+		bindings = []struct{ key, desc string }{
+			{"↑/k, ↓/j", "Navigate list"},
+			{"A", "Restore session"},
+			{"d", "Delete session"},
+			{"e", "Export to markdown"},
+			{"/", "Search sessions"},
+			{"s", "Cycle sort (date/project/messages)"},
+			{"a", "Toggle all projects / current dir"},
+			{"Tab", "Switch preview mode"},
+			{"h/l", "Switch project tabs (all mode)"},
+			{"V", "Back to active sessions"},
+			{"?", "This help"},
+			{"R", "Refresh list"},
+			{"q", "Quit"},
+		}
+	} else {
+		bindings = []struct{ key, desc string }{
+			{"↑/k, ↓/j", "Navigate list"},
+			{"Enter", "Resume session"},
+			{"n", "New Claude session"},
+			{"d", "Delete session"},
+			{"r", "Rename (edit summary)"},
+			{"/", "Search sessions"},
+			{"s", "Cycle sort (date/project/messages)"},
+			{"a", "Toggle all projects / current dir"},
+			{"Tab", "Switch preview mode"},
+			{"Space", "Multi-select"},
+			{"e", "Export to markdown"},
+			{"A", "Archive session"},
+			{"V", "View archived sessions"},
+			{"h/l", "Switch project tabs (all mode)"},
+			{"?", "This help"},
+			{"S", "Statistics"},
+			{"R", "Refresh list"},
+			{"q", "Quit"},
+		}
 	}
 
 	title := Styles.Title.Render("Keyboard Shortcuts") + "\n\n"
@@ -766,19 +1065,48 @@ func (m Model) renderStats() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-func renderMessages(msgs []ParsedMessage) string {
-	var out string
-	for _, msg := range msgs {
+func renderMessages(msgs []ParsedMessage, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+
+	renderer, _ := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(width),
+	)
+
+	sepWidth := width
+	if sepWidth > 40 {
+		sepWidth = 40
+	}
+	separator := Styles.MsgSeparator.Render(strings.Repeat("─", sepWidth))
+
+	var out strings.Builder
+	for i, msg := range msgs {
+		if i > 0 {
+			out.WriteString(separator + "\n")
+		}
 		switch msg.Type {
 		case "user":
-			out += Styles.UserMsg.Render("> "+msg.Content) + "\n\n"
+			out.WriteString(Styles.UserLabel.Render("YOU") + "\n")
+			out.WriteString(Styles.UserMsg.Render(msg.Content) + "\n\n")
 		case "assistant":
-			out += Styles.AssistantMsg.Render(msg.Content) + "\n\n"
+			out.WriteString(Styles.AssistantLabel.Render("CLAUDE") + "\n")
+			if renderer != nil {
+				if rendered, err := renderer.Render(msg.Content); err == nil {
+					out.WriteString(rendered + "\n")
+				} else {
+					out.WriteString(Styles.AssistantMsg.Render(msg.Content) + "\n\n")
+				}
+			} else {
+				out.WriteString(Styles.AssistantMsg.Render(msg.Content) + "\n\n")
+			}
 		case "summary":
-			out += Styles.SummaryMsg.Render("Summary: "+msg.Content) + "\n\n"
+			out.WriteString(Styles.SummaryLabel.Render("SUMMARY") + "\n")
+			out.WriteString(Styles.SummaryMsg.Render(msg.Content) + "\n\n")
 		}
 	}
-	return out
+	return out.String()
 }
 
 // placeOverlay places a dialog box centered over the base content.
@@ -824,33 +1152,41 @@ func (m Model) loadPreviewCmd(s session.Session) tea.Cmd {
 
 func (m Model) liveCaptureCmd(s session.Session) tea.Cmd {
 	return func() tea.Msg {
-		windowName := tmux.WindowName(s.ShortID())
-		if !tmux.WindowExists(windowName) {
-			return LiveCaptureMsg{SessionID: s.SessionID, Content: "Session not running in tmux"}
+		if !m.ptyMgr.IsRunning(s.SessionID) {
+			return LiveCaptureMsg{SessionID: s.SessionID, Content: "Session not running"}
 		}
-		content, err := tmux.CapturPane(windowName)
-		return LiveCaptureMsg{SessionID: s.SessionID, Content: content, Err: err}
+		content := m.ptyMgr.Capture(s.SessionID)
+		return LiveCaptureMsg{SessionID: s.SessionID, Content: content}
 	}
 }
 
 func (m Model) resumeSessionCmd(s session.Session) tea.Cmd {
+	if m.ptyMgr.IsRunning(s.SessionID) {
+		// Already running — attach to it
+		return tea.Exec(
+			&attachExecCmd{mgr: m.ptyMgr, sessionID: s.SessionID},
+			func(err error) tea.Msg {
+				return SessionResumedMsg{Session: s, Err: err}
+			},
+		)
+	}
+	// Launch in PTY, then attach
 	return func() tea.Msg {
-		if !m.hasTmux {
-			return SessionResumedMsg{Session: s, Err: fmt.Errorf("tmux not available")}
+		if err := m.ptyMgr.Launch(s.SessionID, s.ProjectPath); err != nil {
+			return SessionResumedMsg{Session: s, Err: err}
 		}
-		err := tmux.CreateWindow(s.SessionID, s.ShortID(), s.ProjectPath)
-		return SessionResumedMsg{Session: s, Err: err}
+		return attachMsg{session: s}
 	}
 }
 
 func (m Model) newSessionCmd() tea.Cmd {
 	return func() tea.Msg {
-		if !m.hasTmux {
-			return SessionResumedMsg{Err: fmt.Errorf("tmux not available")}
-		}
 		home, _ := os.UserHomeDir()
-		err := tmux.CreateNewSession(home)
-		return SessionResumedMsg{Err: err}
+		sessionID := fmt.Sprintf("new-%d", time.Now().UnixNano())
+		if err := m.ptyMgr.LaunchNew(sessionID, home); err != nil {
+			return SessionResumedMsg{Err: err}
+		}
+		return attachMsg{session: session.Session{SessionID: sessionID, ProjectPath: home}}
 	}
 }
 
@@ -884,12 +1220,49 @@ func (m Model) archiveSessionCmd(s session.Session) tea.Cmd {
 	}
 }
 
-func detectRunningCmd() tea.Cmd {
+func (m Model) loadArchivedSessionsCmd() tea.Cmd {
 	return func() tea.Msg {
-		shortIDs := tmux.DetectRunning()
-		return RunningSessionsMsg{RunningIDs: shortIDs}
+		sessions, projects, err := session.LoadArchived(m.cfg.ClaudeDir)
+		return ArchivedSessionsLoadedMsg{
+			Sessions: sessions,
+			Projects: projects,
+			Err:      err,
+		}
 	}
 }
+
+func (m Model) restoreSessionCmd(s session.Session) tea.Cmd {
+	return func() tea.Msg {
+		err := session.Restore(s)
+		return SessionRestoredMsg{SessionID: s.SessionID, Err: err}
+	}
+}
+
+func (m Model) detectRunningCmd() tea.Cmd {
+	return func() tea.Msg {
+		running := m.ptyMgr.DetectRunning()
+		return RunningSessionsMsg{RunningIDs: running}
+	}
+}
+
+// attachMsg signals that a PTY session was launched and needs attaching.
+type attachMsg struct {
+	session session.Session
+}
+
+// attachExecCmd implements tea.ExecCommand for in-process PTY attach.
+type attachExecCmd struct {
+	mgr       *ptymanager.Manager
+	sessionID string
+}
+
+func (a *attachExecCmd) Run() error {
+	return ptymanager.AttachFunc(a.mgr, a.sessionID)()
+}
+
+func (a *attachExecCmd) SetStdin(io.Reader)  {}
+func (a *attachExecCmd) SetStdout(io.Writer) {}
+func (a *attachExecCmd) SetStderr(io.Writer) {}
 
 // tickCmd returns a command that sends a tick after the given duration.
 type tickMsg time.Time

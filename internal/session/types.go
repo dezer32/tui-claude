@@ -19,6 +19,7 @@ type Session struct {
 	// Runtime fields (not from JSON)
 	ProjectName string `json:"-"`
 	IsRunning   bool   `json:"-"`
+	IsArchived  bool   `json:"-"`
 	Selected    bool   `json:"-"`
 }
 
@@ -33,7 +34,7 @@ func (s Session) DisplayTitle() string {
 	return s.FirstPrompt
 }
 
-// ShortID returns first 8 chars of sessionId for tmux window naming.
+// ShortID returns first 8 chars of sessionId.
 func (s Session) ShortID() string {
 	if len(s.SessionID) >= 8 {
 		return s.SessionID[:8]

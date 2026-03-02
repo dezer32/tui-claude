@@ -149,7 +149,7 @@ func parseUserMessage(entry jsonlEntry) (ParsedMessage, bool) {
 		return ParsedMessage{}, false
 	}
 
-	return ParsedMessage{Type: "user", Content: truncate(content, 500)}, true
+	return ParsedMessage{Type: "user", Content: content}, true
 }
 
 func parseAssistantMessage(entry jsonlEntry) (ParsedMessage, bool) {
@@ -167,7 +167,7 @@ func parseAssistantMessage(entry jsonlEntry) (ParsedMessage, bool) {
 		return ParsedMessage{}, false
 	}
 
-	return ParsedMessage{Type: "assistant", Content: truncate(content, 500)}, true
+	return ParsedMessage{Type: "assistant", Content: content}, true
 }
 
 // extractContent handles both string content and array-of-blocks content.
@@ -215,6 +215,47 @@ type SessionMeta struct {
 	FirstPrompt string
 	Summary     string
 	FullPath    string
+}
+
+// ExtractMeta quickly scans a JSONL file to extract firstPrompt, summary, and message count.
+func ExtractMeta(path string) (firstPrompt, summary string, msgCount int) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var entry jsonlEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+
+		switch entry.Type {
+		case "user":
+			msgCount++
+			if firstPrompt == "" {
+				if msg, ok := parseUserMessage(entry); ok {
+					firstPrompt = msg.Content
+				}
+			}
+		case "assistant":
+			msgCount++
+		case "summary":
+			if entry.Summary != "" {
+				summary = entry.Summary
+			}
+		}
+	}
+	return
 }
 
 // GetMeta returns session metadata for preview.

@@ -86,6 +86,12 @@ func Export(s Session, outputDir string, maxSize int64, maxMessages int) (string
 
 // Archive moves session file to an archive directory.
 func Archive(s Session) error {
+	// If source file doesn't exist, just remove from index
+	if _, err := os.Stat(s.FullPath); os.IsNotExist(err) {
+		_ = addToArchiveIndex(s)
+		return removeFromIndex(s)
+	}
+
 	archiveDir := filepath.Join(filepath.Dir(s.FullPath), "archive")
 	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 		return err
@@ -96,7 +102,35 @@ func Archive(s Session) error {
 		return err
 	}
 
+	// Update the FullPath to point to the archived location
+	archived := s
+	archived.FullPath = dest
+	_ = addToArchiveIndex(archived)
+
 	return removeFromIndex(s)
+}
+
+// Restore moves a session from archive back to active.
+func Restore(s Session) error {
+	sessionsDir := filepath.Dir(archiveIndexPath(s))
+	dest := filepath.Join(sessionsDir, filepath.Base(s.FullPath))
+
+	// Move file from archive/ back to sessions dir
+	if _, err := os.Stat(s.FullPath); err == nil {
+		if err := os.Rename(s.FullPath, dest); err != nil {
+			return fmt.Errorf("restore session file: %w", err)
+		}
+	}
+
+	// Update FullPath for the active index
+	restored := s
+	restored.FullPath = dest
+
+	if err := addToIndex(restored); err != nil {
+		return err
+	}
+
+	return removeFromArchiveIndex(s)
 }
 
 func removeFromIndex(s Session) error {
@@ -133,4 +167,84 @@ func writeIndex(path string, index SessionIndex) error {
 
 func indexPathForSession(s Session) string {
 	return filepath.Join(filepath.Dir(s.FullPath), "sessions-index.json")
+}
+
+func archiveIndexPath(s Session) string {
+	// For archived sessions, FullPath is inside archive/, so go up two levels
+	dir := filepath.Dir(s.FullPath)
+	if filepath.Base(dir) == "archive" {
+		dir = filepath.Dir(dir)
+	}
+	return filepath.Join(dir, "archive-index.json")
+}
+
+func addToArchiveIndex(s Session) error {
+	path := archiveIndexPath(s)
+
+	var index SessionIndex
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &index)
+	}
+	if index.Version == 0 {
+		index.Version = 1
+	}
+
+	// Avoid duplicates
+	for _, e := range index.Entries {
+		if e.SessionID == s.SessionID {
+			return nil
+		}
+	}
+
+	index.Entries = append(index.Entries, s)
+	return writeIndex(path, index)
+}
+
+func removeFromArchiveIndex(s Session) error {
+	path := archiveIndexPath(s)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var index SessionIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return err
+	}
+
+	var remaining []Session
+	for _, e := range index.Entries {
+		if e.SessionID != s.SessionID {
+			remaining = append(remaining, e)
+		}
+	}
+	index.Entries = remaining
+
+	return writeIndex(path, index)
+}
+
+func addToIndex(s Session) error {
+	indexPath := filepath.Join(filepath.Dir(s.FullPath), "sessions-index.json")
+
+	var index SessionIndex
+	if data, err := os.ReadFile(indexPath); err == nil {
+		_ = json.Unmarshal(data, &index)
+	}
+	if index.Version == 0 {
+		index.Version = 1
+	}
+
+	// Avoid duplicates
+	for _, e := range index.Entries {
+		if e.SessionID == s.SessionID {
+			return nil
+		}
+	}
+
+	index.Entries = append(index.Entries, s)
+	return writeIndex(indexPath, index)
 }
