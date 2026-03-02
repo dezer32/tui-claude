@@ -2,7 +2,6 @@ package app
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +72,11 @@ type Model struct {
 
 	// Error display
 	lastError string
+
+	// Embedded terminal
+	focusPanel        FocusPanel
+	attachedSessionID string
+	ptyOutputCh       chan struct{}
 }
 
 // NewModel creates a new app model.
@@ -161,8 +165,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.updateLayout()
-		// Sync VT emulator size with preview viewport for running sessions
-		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
+		// Sync VT emulator and PTY size
+		if m.attachedSessionID != "" {
+			m.ptyMgr.ResizeEmulator(m.attachedSessionID, m.preview.Width, m.preview.Height)
+			m.ptyMgr.ResizePTY(m.attachedSessionID, m.preview.Width, m.preview.Height)
+		} else if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 			m.ptyMgr.ResizeEmulator(sel.session.SessionID, m.preview.Width, m.preview.Height)
 		}
 		return m, nil
@@ -172,7 +179,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastError = msg.Err.Error()
 			return m, nil
 		}
-		m.allSessions = msg.Sessions
+		// Preserve synthetic "new-*" entries for running sessions not yet on disk
+		newSessions := msg.Sessions
+		for _, old := range m.allSessions {
+			if len(old.SessionID) <= 4 || old.SessionID[:4] != "new-" {
+				continue
+			}
+			if !m.ptyMgr.IsRunning(old.SessionID) {
+				continue
+			}
+			// Check if still absent from disk data
+			found := false
+			for _, ns := range newSessions {
+				if ns.SessionID == old.SessionID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newSessions = append(newSessions, old)
+			}
+		}
+		m.allSessions = newSessions
 		m.projects = msg.Projects
 		m.rekeyNewSessions()
 		m.applyFilters()
@@ -180,6 +208,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case RunningSessionsMsg:
 		m.runningIDs = msg.RunningIDs
+		m.applyFilters()
+		return m, nil
+
+	case enrichedSessionsMsg:
+		for i := range m.allSessions {
+			if meta, ok := msg[m.allSessions[i].SessionID]; ok {
+				if meta.summary != "" {
+					m.allSessions[i].Summary = meta.summary
+				}
+				if meta.firstPrompt != "" {
+					m.allSessions[i].FirstPrompt = meta.firstPrompt
+				}
+				m.allSessions[i].MsgCount = meta.msgCount
+			}
+		}
 		m.applyFilters()
 		return m, nil
 
@@ -199,13 +242,69 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.preview.SetContent(m.previewContent)
 		return m, nil
 
-	case attachMsg:
-		return m, tea.Exec(
-			&attachExecCmd{mgr: m.ptyMgr, sessionID: msg.session.SessionID},
-			func(err error) tea.Msg {
-				return SessionResumedMsg{Session: msg.session, Err: err}
-			},
+	case embeddedAttachMsg:
+		// Detach previous session if any
+		if m.attachedSessionID != "" {
+			m.ptyMgr.SetForward(m.attachedSessionID, nil)
+			if m.ptyOutputCh != nil {
+				close(m.ptyOutputCh)
+			}
+		}
+		m.attachedSessionID = msg.sessionID
+		m.focusPanel = FocusRight
+		m.previewMode = PreviewLive
+		m.sessionFilter = FilterActive
+		// Immediately mark as running so it appears in Active filter
+		if m.runningIDs == nil {
+			m.runningIDs = make(map[string]bool)
+		}
+		m.runningIDs[msg.sessionID] = true
+		// For new sessions not yet on disk, add a synthetic entry
+		found := false
+		for _, s := range m.allSessions {
+			if s.SessionID == msg.sessionID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.allSessions = append(m.allSessions, session.Session{
+				SessionID:   msg.sessionID,
+				ProjectPath: msg.projectPath,
+				ProjectName: filepath.Base(msg.projectPath),
+				Summary:     "New session",
+				Modified:    time.Now(),
+				IsRunning:   true,
+			})
+		}
+		m.applyFilters()
+		// Resize VT emulator and PTY to match preview panel
+		m.ptyMgr.ResizeEmulator(msg.sessionID, m.preview.Width, m.preview.Height)
+		m.ptyMgr.ResizePTY(msg.sessionID, m.preview.Width, m.preview.Height)
+		// Set up PTY output notification channel
+		m.ptyOutputCh = make(chan struct{}, 1)
+		m.ptyMgr.SetForward(msg.sessionID, &chanNotifyWriter{ch: m.ptyOutputCh})
+		// Initial render
+		content := m.ptyMgr.Capture(msg.sessionID)
+		m.previewContent = content
+		m.preview.SetContent(content)
+		m.preview.GotoBottom()
+		return m, tea.Batch(
+			listenForPTYOutput(m.ptyOutputCh),
+			m.detectRunningCmd(),
 		)
+
+	case PTYOutputMsg:
+		if m.attachedSessionID != "" {
+			content := m.ptyMgr.Capture(m.attachedSessionID)
+			m.previewContent = content
+			m.preview.SetContent(content)
+			m.preview.GotoBottom()
+			if m.ptyOutputCh != nil {
+				return m, listenForPTYOutput(m.ptyOutputCh)
+			}
+		}
+		return m, nil
 
 	case DialogResultMsg:
 		return m.handleDialogResult(msg)
@@ -277,8 +376,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{
 			m.detectRunningCmd(),
 			tickCmd(2 * time.Second),
+			loadSessionsCmd(m.cfg.ClaudeDir),
+			m.enrichRunningCmd(),
 		}
-		if m.previewMode == PreviewLive {
+		// Auto-detach if attached session is no longer running
+		if m.attachedSessionID != "" && !m.ptyMgr.IsRunning(m.attachedSessionID) {
+			m.ptyMgr.SetForward(m.attachedSessionID, nil)
+			if m.ptyOutputCh != nil {
+				close(m.ptyOutputCh)
+				m.ptyOutputCh = nil
+			}
+			m.focusPanel = FocusLeft
+			m.attachedSessionID = ""
+		}
+		if m.previewMode == PreviewLive && m.attachedSessionID == "" {
 			if sel, ok := m.list.SelectedItem().(sessionItem); ok {
 				cmds = append(cmds, m.liveCaptureCmd(sel.session))
 			}
@@ -308,6 +419,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Embedded terminal mode: forward all keys to PTY
+	if m.focusPanel == FocusRight && m.attachedSessionID != "" {
+		return m.handleTerminalKey(msg)
+	}
+
 	// Global keys
 	if key.Matches(msg, m.keys.Quit) && m.state == StateNormal {
 		return m, tea.Quit
@@ -337,6 +453,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m Model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+] — detach from embedded terminal
+	if key.Matches(msg, m.keys.Detach) || msg.Type == tea.KeyCtrlCloseBracket {
+		return m.detachTerminal()
+	}
+
+	// Forward all other keys to PTY
+	raw := ptymanager.KeyMsgToBytes(msg)
+	if raw != nil {
+		m.ptyMgr.WriteToPTY(m.attachedSessionID, raw)
+	}
+	return m, nil
+}
+
+// detachTerminal detaches from embedded terminal and returns focus to list.
+func (m Model) detachTerminal() (tea.Model, tea.Cmd) {
+	m.ptyMgr.SetForward(m.attachedSessionID, nil)
+	if m.ptyOutputCh != nil {
+		close(m.ptyOutputCh)
+		m.ptyOutputCh = nil
+	}
+	m.focusPanel = FocusLeft
+	m.attachedSessionID = ""
+	return m, tea.Batch(
+		loadSessionsCmd(m.cfg.ClaudeDir),
+		m.detectRunningCmd(),
+	)
 }
 
 func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -439,7 +584,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if sel, ok := m.list.SelectedItem().(sessionItem); ok {
-			return m, m.resumeSessionCmd(sel.session)
+			return m, m.embedSessionCmd(sel.session)
 		}
 		return m, nil
 
@@ -699,8 +844,13 @@ func (m *Model) rekeyNewSessions() {
 	}
 
 	for newID, projPath := range pending {
+		// Extract creation time from "new-<unixnano>" ID
+		var createdNano int64
+		fmt.Sscanf(newID, "new-%d", &createdNano)
+		createdTime := time.Unix(0, createdNano)
+
 		// Find the newest disk session matching this project path
-		// that isn't already tracked by the PTY manager under a real ID
+		// that was modified AFTER the PTY was created and isn't already tracked
 		var bestID string
 		var bestTime time.Time
 		for _, s := range m.allSessions {
@@ -710,6 +860,12 @@ func (m *Model) rekeyNewSessions() {
 			if m.ptyMgr.IsRunning(s.SessionID) {
 				continue // already tracked under real ID
 			}
+			if len(s.SessionID) > 4 && s.SessionID[:4] == "new-" {
+				continue // skip synthetic entries
+			}
+			if !s.Modified.After(createdTime.Add(-5 * time.Second)) {
+				continue // only match sessions created after PTY launch
+			}
 			if s.Modified.After(bestTime) {
 				bestTime = s.Modified
 				bestID = s.SessionID
@@ -717,6 +873,17 @@ func (m *Model) rekeyNewSessions() {
 		}
 		if bestID != "" {
 			m.ptyMgr.RekeySession(newID, bestID)
+			// Update attachedSessionID if this was the embedded session
+			if m.attachedSessionID == newID {
+				m.attachedSessionID = bestID
+			}
+			// Remove the synthetic entry now that we have the real one
+			for i, s := range m.allSessions {
+				if s.SessionID == newID {
+					m.allSessions = append(m.allSessions[:i], m.allSessions[i+1:]...)
+					break
+				}
+			}
 		}
 	}
 }
@@ -849,22 +1016,28 @@ func (m Model) renderContent() string {
 		}
 	}
 
-	// List panel title
+	// List panel title — highlight border based on focus
 	listTitle := "Sessions (" + itoa(len(m.sessions)) + ")"
 	listBorderColor := ColorBorderDim
 	listTitleColor := ColorCyan
+	if m.focusPanel == FocusLeft || m.attachedSessionID == "" {
+		listBorderColor = ColorBorderActive
+	}
 	listPanel := renderTitledPanel(listTitle, listView, listWidth, contentHeight, listBorderColor, listTitleColor)
 
 	if !m.cfg.PreviewEnabled {
 		return listPanel
 	}
 
-	// Preview panel
+	// Preview panel — highlight border when terminal has focus
 	previewWidth := m.width - listWidth
 	previewContent := m.preview.View()
 	previewTitle := m.previewTitleLine()
 	previewBorderColor := ColorBorderDim
 	previewTitleColor := ColorCyan
+	if m.focusPanel == FocusRight && m.attachedSessionID != "" {
+		previewBorderColor = ColorBorderActive
+	}
 	previewPanel := renderTitledPanel(previewTitle, previewContent, previewWidth, contentHeight, previewBorderColor, previewTitleColor)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, listPanel, previewPanel)
@@ -987,7 +1160,10 @@ func (m Model) renderStatusBar() string {
 
 	// Key hints on the right — adapt to mode
 	var right string
-	if m.sessionFilter == FilterArchived {
+	if m.focusPanel == FocusRight && m.attachedSessionID != "" {
+		right = renderKeyHint("Ctrl+]", "detach") + sep +
+			renderKeyHint("", "typing goes to Claude")
+	} else if m.sessionFilter == FilterArchived {
 		right = renderKeyHint("A", "restore") + sep +
 			renderKeyHint("d", "delete") + sep +
 			renderKeyHint("e", "export") + sep +
@@ -1071,7 +1247,8 @@ func (m Model) renderHelp() string {
 	} else {
 		bindings = []struct{ key, desc string }{
 			{"↑/k, ↓/j", "Navigate list"},
-			{"Enter", "Resume session"},
+			{"Enter", "Open session in panel"},
+			{"Ctrl+]", "Detach from terminal"},
 			{"n", "New Claude session"},
 			{"d", "Delete session"},
 			{"r", "Rename (edit summary)"},
@@ -1185,6 +1362,32 @@ func placeOverlay(width, height int, overlay, base string) string {
 	)
 }
 
+// chanNotifyWriter is an io.Writer that sends a non-blocking signal to a
+// buffered channel on each Write. Used to bridge PTY output to Bubble Tea.
+type chanNotifyWriter struct {
+	ch chan struct{}
+}
+
+func (w *chanNotifyWriter) Write(p []byte) (int, error) {
+	select {
+	case w.ch <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+// listenForPTYOutput returns a tea.Cmd that blocks until the channel receives
+// a signal, then returns a PTYOutputMsg.
+func listenForPTYOutput(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		_, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return PTYOutputMsg{}
+	}
+}
+
 // Commands
 
 func (m Model) loadPreviewCmd(s session.Session) tea.Cmd {
@@ -1228,22 +1431,17 @@ func (m Model) liveCaptureCmd(s session.Session) tea.Cmd {
 	}
 }
 
-func (m Model) resumeSessionCmd(s session.Session) tea.Cmd {
+func (m Model) embedSessionCmd(s session.Session) tea.Cmd {
 	if m.ptyMgr.IsRunning(s.SessionID) {
-		// Already running — attach to it
-		return tea.Exec(
-			&attachExecCmd{mgr: m.ptyMgr, sessionID: s.SessionID},
-			func(err error) tea.Msg {
-				return SessionResumedMsg{Session: s, Err: err}
-			},
-		)
+		return func() tea.Msg {
+			return embeddedAttachMsg{sessionID: s.SessionID, projectPath: s.ProjectPath}
+		}
 	}
-	// Launch in PTY, then attach
 	return func() tea.Msg {
 		if err := m.ptyMgr.Launch(s.SessionID, s.ProjectPath); err != nil {
 			return SessionResumedMsg{Session: s, Err: err}
 		}
-		return attachMsg{session: s}
+		return embeddedAttachMsg{sessionID: s.SessionID, projectPath: s.ProjectPath}
 	}
 }
 
@@ -1257,7 +1455,7 @@ func (m Model) newSessionCmd() tea.Cmd {
 		if err := m.ptyMgr.LaunchNew(sessionID, dir); err != nil {
 			return SessionResumedMsg{Err: err}
 		}
-		return attachMsg{session: session.Session{SessionID: sessionID, ProjectPath: dir}}
+		return embeddedAttachMsg{sessionID: sessionID, projectPath: dir}
 	}
 }
 
@@ -1316,24 +1514,34 @@ func (m Model) detectRunningCmd() tea.Cmd {
 	}
 }
 
-// attachMsg signals that a PTY session was launched and needs attaching.
-type attachMsg struct {
-	session session.Session
+// enrichRunningCmd reads fresh metadata from JSONL files for running sessions.
+func (m Model) enrichRunningCmd() tea.Cmd {
+	type info struct {
+		id   string
+		path string
+	}
+	var running []info
+	for _, s := range m.allSessions {
+		if m.runningIDs[s.SessionID] && s.FullPath != "" {
+			running = append(running, info{id: s.SessionID, path: s.FullPath})
+		}
+	}
+	if len(running) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		results := make(enrichedSessionsMsg)
+		for _, r := range running {
+			firstPrompt, summary, msgCount := session.ExtractMeta(r.path)
+			results[r.id] = enrichedMeta{
+				firstPrompt: firstPrompt,
+				summary:     summary,
+				msgCount:    msgCount,
+			}
+		}
+		return results
+	}
 }
-
-// attachExecCmd implements tea.ExecCommand for in-process PTY attach.
-type attachExecCmd struct {
-	mgr       *ptymanager.Manager
-	sessionID string
-}
-
-func (a *attachExecCmd) Run() error {
-	return ptymanager.AttachFunc(a.mgr, a.sessionID)()
-}
-
-func (a *attachExecCmd) SetStdin(io.Reader)  {}
-func (a *attachExecCmd) SetStdout(io.Writer) {}
-func (a *attachExecCmd) SetStderr(io.Writer) {}
 
 // tickCmd returns a command that sends a tick after the given duration.
 type tickMsg time.Time

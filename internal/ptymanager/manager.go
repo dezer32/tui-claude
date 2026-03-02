@@ -128,6 +128,32 @@ func (m *Manager) SetForward(sessionID string, w io.Writer) {
 	}
 }
 
+// WriteToPTY writes raw bytes to the PTY master fd of a session.
+func (m *Manager) WriteToPTY(sessionID string, data []byte) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	if s.ptmx == nil {
+		return fmt.Errorf("session %s has no PTY", sessionID)
+	}
+	_, err := s.ptmx.Write(data)
+	return err
+}
+
+// ResizePTY updates the PTY window size for a session.
+func (m *Manager) ResizePTY(sessionID string, w, h int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if s, ok := m.sessions[sessionID]; ok {
+		s.ResizePTY(w, h)
+	}
+}
+
 // ResizeEmulator updates the VT emulator dimensions for a session.
 func (m *Manager) ResizeEmulator(sessionID string, w, h int) {
 	m.mu.RLock()

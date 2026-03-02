@@ -178,6 +178,13 @@ func (s *ManagedSession) SetForward(w io.Writer) {
 	s.forwardW = w
 }
 
+// ResizePTY updates the PTY window size.
+func (s *ManagedSession) ResizePTY(w, h int) {
+	if s.ptmx != nil {
+		pty.Setsize(s.ptmx, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
+	}
+}
+
 // CaptureOutput returns the VT emulator render — a string with proper
 // SGR codes (colors, bold) reconstructed from the virtual terminal state.
 func (s *ManagedSession) CaptureOutput() string {

@@ -26,6 +26,7 @@ type KeyMap struct {
 	TabLeft   key.Binding
 	TabRight  key.Binding
 	Escape    key.Binding
+	Detach    key.Binding
 }
 
 // DefaultKeyMap returns the default keybindings.
@@ -118,6 +119,10 @@ func DefaultKeyMap() KeyMap {
 		Escape: key.NewBinding(
 			key.WithKeys("esc"),
 			key.WithHelp("esc", "cancel"),
+		),
+		Detach: key.NewBinding(
+			key.WithKeys("ctrl+]"),
+			key.WithHelp("Ctrl+]", "detach"),
 		),
 	}
 }

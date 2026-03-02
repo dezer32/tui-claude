@@ -60,6 +60,16 @@ type RunningSessionsMsg struct {
 	RunningIDs map[string]bool
 }
 
+// enrichedMeta holds fresh metadata extracted from a JSONL file.
+type enrichedMeta struct {
+	firstPrompt string
+	summary     string
+	msgCount    int
+}
+
+// enrichedSessionsMsg carries updated metadata for running sessions.
+type enrichedSessionsMsg map[string]enrichedMeta
+
 // ArchivedSessionsLoadedMsg is sent when archived sessions are loaded.
 type ArchivedSessionsLoadedMsg struct {
 	Sessions []session.Session
@@ -71,6 +81,23 @@ type ArchivedSessionsLoadedMsg struct {
 type SessionRestoredMsg struct {
 	SessionID string
 	Err       error
+}
+
+// FocusPanel indicates which panel has input focus.
+type FocusPanel int
+
+const (
+	FocusLeft  FocusPanel = iota // session list
+	FocusRight                   // embedded terminal
+)
+
+// PTYOutputMsg signals that the PTY produced new output.
+type PTYOutputMsg struct{}
+
+// embeddedAttachMsg signals that a session is ready for embedded display.
+type embeddedAttachMsg struct {
+	sessionID   string
+	projectPath string
 }
 
 // ParsedMessage represents a single message from JSONL.
