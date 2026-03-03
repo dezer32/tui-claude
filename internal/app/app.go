@@ -2,12 +2,10 @@ package app
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -16,22 +14,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/vladislav-k/tui-claude/internal/config"
 	"github.com/vladislav-k/tui-claude/internal/ptymanager"
 	"github.com/vladislav-k/tui-claude/internal/session"
 )
-
-// dbg is a temporary debug logger; writes to /tmp/tui-debug.log.
-var dbg *log.Logger
-
-func init() {
-	f, err := os.OpenFile("/tmp/tui-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		dbg = log.New(os.Stderr, "[DBG] ", log.Ltime|log.Lmicroseconds)
-	} else {
-		dbg = log.New(f, "", log.Ltime|log.Lmicroseconds)
-	}
-}
 
 // State represents the current UI state.
 type State int
@@ -195,19 +182,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastError = msg.Err.Error()
 			return m, nil
 		}
-		dbg.Printf("SessionsLoadedMsg: %d sessions from index, runningIDs=%v", len(msg.Sessions), m.runningIDs)
-		for _, s := range msg.Sessions {
-			if m.ptyMgr.IsRunning(s.SessionID) {
-				dbg.Printf(
-					"  index session (running): id=%s path=%q summary=%q fp=%q mc=%d",
-					s.SessionID,
-					s.FullPath,
-					s.Summary,
-					s.FirstPrompt[:min(len(s.FirstPrompt), 40)],
-					s.MsgCount,
-				)
-			}
-		}
 		// Preserve running sessions absent from the index. This covers both
 		// synthetic "new-*" entries and rekeyed sessions whose JSONL exists
 		// on disk but hasn't been added to sessions-index.json yet.
@@ -251,18 +225,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh running IDs after rekeying so that applyFilters and
 		// enrichRunningCmd see the real session UUIDs, not stale "new-*" keys.
 		m.runningIDs = m.ptyMgr.DetectRunning()
-		dbg.Printf("after rekey: runningIDs=%v", m.runningIDs)
-		for _, s := range m.allSessions {
-			if m.runningIDs[s.SessionID] {
-				dbg.Printf(
-					"  will enrich? id=%s path=%q summary=%q mc=%d",
-					s.SessionID,
-					s.FullPath,
-					s.Summary,
-					s.MsgCount,
-				)
-			}
-		}
 		m.applyFilters()
 		return m, m.enrichRunningCmd()
 
@@ -299,16 +261,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case enrichedSessionsMsg:
-		dbg.Printf("enrichedSessionsMsg: %d entries", len(msg))
-		for id, meta := range msg {
-			dbg.Printf(
-				"  enriched: id=%s summary=%q fp=%q mc=%d",
-				id,
-				meta.summary,
-				meta.firstPrompt[:min(len(meta.firstPrompt), 40)],
-				meta.msgCount,
-			)
-		}
 		for i := range m.allSessions {
 			if meta, ok := msg[m.allSessions[i].SessionID]; ok {
 				if meta.summary != "" {
@@ -341,12 +293,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case embeddedAttachMsg:
 		// Detach previous session if any
-		if m.attachedSessionID != "" {
-			m.ptyMgr.SetForward(m.attachedSessionID, nil)
-			if m.ptyOutputCh != nil {
-				close(m.ptyOutputCh)
-			}
-		}
+		m.doDetach()
 		m.attachedSessionID = msg.sessionID
 		m.focusPanel = FocusRight
 		m.previewMode = PreviewLive
@@ -475,15 +422,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{
 			m.detectRunningCmd(),
 			tickCmd(2 * time.Second),
-			loadSessionsCmd(m.cfg.ClaudeDir),
+		}
+		if len(m.runningIDs) > 0 || m.attachedSessionID != "" {
+			cmds = append(cmds, loadSessionsCmd(m.cfg.ClaudeDir))
 		}
 		// Auto-detach if attached session is no longer running
 		if m.attachedSessionID != "" && !m.ptyMgr.IsRunning(m.attachedSessionID) {
-			m.ptyMgr.SetForward(m.attachedSessionID, nil)
-			if m.ptyOutputCh != nil {
-				close(m.ptyOutputCh)
-				m.ptyOutputCh = nil
-			}
+			m.doDetach()
 			m.focusPanel = FocusLeft
 			m.attachedSessionID = ""
 		}
@@ -567,13 +512,23 @@ func (m Model) handleTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// detachTerminal detaches from embedded terminal and returns focus to list.
-func (m Model) detachTerminal() (tea.Model, tea.Cmd) {
+// doDetach clears the PTY forward writer and closes the output channel
+// for the currently attached session. It does NOT reset focusPanel or
+// attachedSessionID — callers handle that themselves.
+func (m *Model) doDetach() {
+	if m.attachedSessionID == "" {
+		return
+	}
 	m.ptyMgr.SetForward(m.attachedSessionID, nil)
 	if m.ptyOutputCh != nil {
 		close(m.ptyOutputCh)
 		m.ptyOutputCh = nil
 	}
+}
+
+// detachTerminal detaches from embedded terminal and returns focus to list.
+func (m Model) detachTerminal() (tea.Model, tea.Cmd) {
+	m.doDetach()
 	m.focusPanel = FocusLeft
 	m.attachedSessionID = ""
 	return m, tea.Batch(
@@ -803,11 +758,11 @@ func (m Model) View() string {
 
 	// Overlay dialogs
 	if m.state == StateConfirmDialog {
-		content = m.renderConfirmOverlay(content)
+		content = m.renderConfirmOverlay()
 	} else if m.state == StateRenameDialog {
-		content = m.renderRenameOverlay(content)
+		content = m.renderRenameOverlay()
 	} else if m.state == StateSearching {
-		content = m.renderSearchOverlay(content)
+		content = m.renderSearchOverlay()
 	}
 
 	return lipgloss.JoinVertical(
@@ -957,7 +912,7 @@ func (m *Model) rekeyNewSessions() {
 	for newID, projPath := range pending {
 		// Extract creation time from "new-<unixnano>" ID
 		var createdNano int64
-		fmt.Sscanf(newID, "new-%d", &createdNano)
+		fmt.Sscanf(newID, ptymanager.SyntheticIDPrefix+"%d", &createdNano)
 		createdTime := time.Unix(0, createdNano)
 
 		// Find the newest disk session matching this project path
@@ -972,7 +927,7 @@ func (m *Model) rekeyNewSessions() {
 			if m.ptyMgr.IsRunning(s.SessionID) {
 				continue // already tracked under real ID
 			}
-			if len(s.SessionID) > 4 && s.SessionID[:4] == "new-" {
+			if ptymanager.IsSyntheticID(s.SessionID) {
 				continue // skip synthetic entries
 			}
 			if !s.Modified.After(createdTime.Add(-5 * time.Second)) {
@@ -994,7 +949,6 @@ func (m *Model) rekeyNewSessions() {
 		}
 
 		if bestID != "" {
-			dbg.Printf("rekey: %s -> %s (path=%s)", newID, bestID, bestPath)
 			m.ptyMgr.RekeySession(newID, bestID)
 			// Update attachedSessionID if this was the embedded session
 			if m.attachedSessionID == newID {
@@ -1123,14 +1077,13 @@ func (i sessionItem) Description() string {
 }
 
 func splitAtWidth(s string, maxWidth int) (first, rest string) {
-	if lipgloss.Width(s) <= maxWidth {
-		return s, ""
-	}
+	w := 0
 	for i, r := range s {
-		candidate := s[:i+utf8.RuneLen(r)]
-		if lipgloss.Width(candidate) > maxWidth {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > maxWidth {
 			return s[:i], s[i:]
 		}
+		w += rw
 	}
 	return s, ""
 }
@@ -1296,17 +1249,11 @@ func renderTitledPanel(title, content string, width, height int, borderColor, ti
 	if topFillWidth < 0 {
 		topFillWidth = 0
 	}
-	topFill := ""
-	for i := 0; i < topFillWidth; i++ {
-		topFill += "─"
-	}
+	topFill := strings.Repeat("─", topFillWidth)
 	topLine := borderStyle.Render("╭─") + " " + titleText + " " + borderStyle.Render(topFill+"╮")
 
 	// Bottom line: ╰──────────╯
-	bottomFill := ""
-	for i := 0; i < innerWidth; i++ {
-		bottomFill += "─"
-	}
+	bottomFill := strings.Repeat("─", innerWidth)
 	bottomLine := borderStyle.Render("╰" + bottomFill + "╯")
 
 	// Side borders for content
@@ -1412,7 +1359,7 @@ func (m Model) renderStatusBar() string {
 	return Styles.StatusBar.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
 }
 
-func (m Model) renderConfirmOverlay(base string) string {
+func (m Model) renderConfirmOverlay() string {
 	title := "Delete session?"
 	switch m.confirmAction {
 	case ConfirmArchive:
@@ -1424,18 +1371,18 @@ func (m Model) renderConfirmOverlay(base string) string {
 		"Press " + Styles.ConfirmYes.Render("y") + " to confirm, " +
 		Styles.ConfirmNo.Render("n") + " to cancel"
 	box := Styles.Dialog.Render(dialog)
-	return placeOverlay(m.width, m.height-2, box, base)
+	return placeOverlay(m.width, m.height-2, box)
 }
 
-func (m Model) renderRenameOverlay(base string) string {
+func (m Model) renderRenameOverlay() string {
 	dialog := Styles.DialogTitle.Render("Rename session") + "\n\n" +
 		m.renameInput.View() + "\n\n" +
 		Styles.HelpDesc.Render("Enter to confirm, Esc to cancel")
 	box := Styles.Dialog.Render(dialog)
-	return placeOverlay(m.width, m.height-2, box, base)
+	return placeOverlay(m.width, m.height-2, box)
 }
 
-func (m Model) renderSearchOverlay(base string) string {
+func (m Model) renderSearchOverlay() string {
 	searchBox := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(ColorCyan).
@@ -1443,7 +1390,7 @@ func (m Model) renderSearchOverlay(base string) string {
 		Padding(0, 1).
 		Width(40).
 		Render(m.searchInput.View())
-	return placeOverlay(m.width, m.height-2, searchBox, base)
+	return placeOverlay(m.width, m.height-2, searchBox)
 }
 
 func (m Model) renderHelp() string {
@@ -1575,8 +1522,8 @@ func renderMessages(msgs []ParsedMessage, width int) string {
 	return out.String()
 }
 
-// placeOverlay places a dialog box centered over the base content.
-func placeOverlay(width, height int, overlay, base string) string {
+// placeOverlay places a dialog box centered on the screen.
+func placeOverlay(width, height int, overlay string) string {
 	return lipgloss.Place(
 		width, height, lipgloss.Center, lipgloss.Center,
 		overlay,
@@ -1673,7 +1620,7 @@ func (m Model) newSessionCmd() tea.Cmd {
 		dir, _ = os.UserHomeDir()
 	}
 	return func() tea.Msg {
-		sessionID := fmt.Sprintf("new-%d", time.Now().UnixNano())
+		sessionID := fmt.Sprintf("%s%d", ptymanager.SyntheticIDPrefix, time.Now().UnixNano())
 		if err := m.ptyMgr.LaunchNew(sessionID, dir); err != nil {
 			return SessionResumedMsg{Err: err}
 		}

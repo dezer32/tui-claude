@@ -4,8 +4,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 )
+
+// SyntheticIDPrefix is the prefix for temporary session IDs assigned to
+// newly launched PTY sessions before their real UUID is known from disk.
+const SyntheticIDPrefix = "new-"
+
+// IsSyntheticID reports whether a session ID is a temporary synthetic ID.
+func IsSyntheticID(id string) bool {
+	return strings.HasPrefix(id, SyntheticIDPrefix)
+}
 
 // Manager manages multiple PTY sessions.
 type Manager struct {
@@ -188,7 +198,7 @@ func (m *Manager) RunningNewSessions() map[string]string {
 
 	result := make(map[string]string)
 	for id, s := range m.sessions {
-		if len(id) > 4 && id[:4] == "new-" && s.IsRunning() {
+		if IsSyntheticID(id) && s.IsRunning() {
 			result[id] = s.ProjectPath
 		}
 	}

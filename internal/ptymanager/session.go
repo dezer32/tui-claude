@@ -105,29 +105,20 @@ func NewManagedSession(sessionID, projectPath string, bufSize int) *ManagedSessi
 
 // Start launches claude --resume in a PTY.
 func (s *ManagedSession) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.cmd = exec.Command("claude", "--resume", s.SessionID)
-	s.cmd.Dir = s.ProjectPath
-	s.cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-
-	var err error
-	s.ptmx, err = pty.StartWithSize(s.cmd, &pty.Winsize{Rows: 40, Cols: 120})
-	if err != nil {
-		return fmt.Errorf("pty start: %w", err)
-	}
-
-	s.startReader()
-	return nil
+	return s.start([]string{"--resume", s.SessionID})
 }
 
 // StartNew launches a fresh claude session (no --resume).
 func (s *ManagedSession) StartNew() error {
+	return s.start(nil)
+}
+
+func (s *ManagedSession) start(extraArgs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.cmd = exec.Command("claude")
+	args := extraArgs
+	s.cmd = exec.Command("claude", args...)
 	s.cmd.Dir = s.ProjectPath
 	s.cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
