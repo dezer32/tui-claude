@@ -117,8 +117,7 @@ func (s *ManagedSession) start(extraArgs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	args := extraArgs
-	s.cmd = exec.Command("claude", args...)
+	s.cmd = exec.Command("claude", extraArgs...)
 	s.cmd.Dir = s.ProjectPath
 	s.cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 

@@ -428,9 +428,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Auto-detach if attached session is no longer running
 		if m.attachedSessionID != "" && !m.ptyMgr.IsRunning(m.attachedSessionID) {
-			m.doDetach()
-			m.focusPanel = FocusLeft
-			m.attachedSessionID = ""
+			m.fullDetach()
 		}
 		if m.previewMode == PreviewLive && m.attachedSessionID == "" {
 			if sel, ok := m.list.SelectedItem().(sessionItem); ok {
@@ -526,11 +524,16 @@ func (m *Model) doDetach() {
 	}
 }
 
-// detachTerminal detaches from embedded terminal and returns focus to list.
-func (m Model) detachTerminal() (tea.Model, tea.Cmd) {
+// fullDetach detaches and resets focus/attachedSessionID to defaults.
+func (m *Model) fullDetach() {
 	m.doDetach()
 	m.focusPanel = FocusLeft
 	m.attachedSessionID = ""
+}
+
+// detachTerminal detaches from embedded terminal and returns focus to list.
+func (m Model) detachTerminal() (tea.Model, tea.Cmd) {
+	m.fullDetach()
 	return m, tea.Batch(
 		loadSessionsCmd(m.cfg.ClaudeDir),
 		m.detectRunningCmd(),
