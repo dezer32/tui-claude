@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -49,9 +50,10 @@ type Model struct {
 	cfg    config.Config
 	keys   KeyMap
 	state  State
-	width  int
-	height int
-	ptyMgr *ptymanager.Manager
+	width         int
+	height        int
+	listTextWidth int
+	ptyMgr        *ptymanager.Manager
 
 	// Data
 	allSessions []session.Session
@@ -124,6 +126,7 @@ func NewModel(cfg config.Config, ptyMgr *ptymanager.Manager) Model {
 		Foreground(ColorTextMuted)
 	delegate.Styles.DimmedDesc = delegate.Styles.DimmedDesc.
 		Foreground(ColorTextMuted)
+	delegate.SetHeight(3)
 
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "Sessions"
@@ -815,20 +818,26 @@ func (m Model) View() string {
 	)
 }
 
+func (m Model) listPanelWidth() int {
+	if !m.cfg.PreviewEnabled {
+		return m.width
+	}
+	return m.width * 3 / 10
+}
+
 func (m *Model) updateLayout() {
 	tabBarHeight := 1
 	statusBarHeight := 1
 	contentHeight := m.height - tabBarHeight - statusBarHeight
 
-	listWidth := m.width * 2 / 5
-	if !m.cfg.PreviewEnabled {
-		listWidth = m.width
-	}
-
+	listWidth := m.listPanelWidth()
 	previewWidth := m.width - listWidth
 
+	listInnerWidth := listWidth - 2
+	m.listTextWidth = listInnerWidth - 2 // 2 = NormalTitle padding
+
 	// List: subtract panel borders (2 left+right) for inner content
-	m.list.SetSize(listWidth-2, contentHeight-2)
+	m.list.SetSize(listInnerWidth, contentHeight-2)
 	// Preview: subtract panel borders (2) + inner padding (2)
 	m.preview.Width = previewWidth - 2 - 2
 	// Preview: subtract top+bottom borders, title is in the top border
@@ -886,7 +895,7 @@ func (m *Model) applyFilters() {
 		if m.sessionFilter != FilterArchived {
 			s.IsRunning = m.runningIDs[s.SessionID]
 		}
-		items[i] = sessionItem{session: s}
+		items[i] = sessionItem{session: s, listTextWidth: m.listTextWidth}
 	}
 	m.list.SetItems(items)
 }
@@ -1070,7 +1079,8 @@ func (m *Model) updateSessionSummary(id, summary string) {
 
 // sessionItem implements list.Item for the bubbles list.
 type sessionItem struct {
-	session session.Session
+	session       session.Session
+	listTextWidth int
 }
 
 func (i sessionItem) Title() string {
@@ -1081,11 +1091,48 @@ func (i sessionItem) Title() string {
 	if i.session.Selected {
 		prefix = Styles.SelectedMark.Render("▸") + " "
 	}
-	return prefix + i.session.DisplayTitle()
+	title := i.session.DisplayTitle()
+	prefixWidth := lipgloss.Width(prefix)
+	available := i.listTextWidth - prefixWidth
+	if available <= 0 || lipgloss.Width(title) <= available {
+		return prefix + title
+	}
+	first, _ := splitAtWidth(title, available)
+	return prefix + first
 }
 
 func (i sessionItem) Description() string {
-	return i.session.ProjectName + " · " + i.session.Age() + " · " + itoa(i.session.MsgCount) + " msgs"
+	meta := i.session.ProjectName + " · " + i.session.Age() + " · " + itoa(i.session.MsgCount) + " msgs"
+	title := i.session.DisplayTitle()
+
+	prefix := "  "
+	if i.session.IsRunning {
+		prefix = Styles.RunningDot.Render("●") + " "
+	}
+	if i.session.Selected {
+		prefix = Styles.SelectedMark.Render("▸") + " "
+	}
+
+	prefixWidth := lipgloss.Width(prefix)
+	available := i.listTextWidth - prefixWidth
+	if available <= 0 || lipgloss.Width(title) <= available {
+		return meta
+	}
+	_, rest := splitAtWidth(title, available)
+	return rest + "\n" + meta
+}
+
+func splitAtWidth(s string, maxWidth int) (first, rest string) {
+	if lipgloss.Width(s) <= maxWidth {
+		return s, ""
+	}
+	for i, r := range s {
+		candidate := s[:i+utf8.RuneLen(r)]
+		if lipgloss.Width(candidate) > maxWidth {
+			return s[:i], s[i:]
+		}
+	}
+	return s, ""
 }
 
 func (i sessionItem) FilterValue() string {
@@ -1159,10 +1206,7 @@ func (m Model) renderTabBar() string {
 }
 
 func (m Model) renderContent() string {
-	listWidth := m.width * 2 / 5
-	if !m.cfg.PreviewEnabled {
-		listWidth = m.width
-	}
+	listWidth := m.listPanelWidth()
 	contentHeight := m.height - 2 // tabBar + statusBar
 
 	listView := m.list.View()

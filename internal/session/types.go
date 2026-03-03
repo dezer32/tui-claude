@@ -23,15 +23,12 @@ type Session struct {
 	Selected    bool   `json:"-"`
 }
 
-// DisplayTitle returns summary if available, otherwise truncated firstPrompt.
+// DisplayTitle returns summary if available, otherwise full firstPrompt.
 func (s Session) DisplayTitle() string {
 	if s.Summary != "" && s.Summary != "New session" {
 		return s.Summary
 	}
 	if s.FirstPrompt != "" {
-		if len(s.FirstPrompt) > 60 {
-			return s.FirstPrompt[:57] + "..."
-		}
 		return s.FirstPrompt
 	}
 	return s.Summary // "New session" fallback until firstPrompt arrives
