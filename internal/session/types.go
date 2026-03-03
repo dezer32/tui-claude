@@ -25,13 +25,16 @@ type Session struct {
 
 // DisplayTitle returns summary if available, otherwise truncated firstPrompt.
 func (s Session) DisplayTitle() string {
-	if s.Summary != "" {
+	if s.Summary != "" && s.Summary != "New session" {
 		return s.Summary
 	}
-	if len(s.FirstPrompt) > 60 {
-		return s.FirstPrompt[:57] + "..."
+	if s.FirstPrompt != "" {
+		if len(s.FirstPrompt) > 60 {
+			return s.FirstPrompt[:57] + "..."
+		}
+		return s.FirstPrompt
 	}
-	return s.FirstPrompt
+	return s.Summary // "New session" fallback until firstPrompt arrives
 }
 
 // ShortID returns first 8 chars of sessionId.
