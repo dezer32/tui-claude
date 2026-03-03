@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,18 @@ import (
 	"github.com/vladislav-k/tui-claude/internal/ptymanager"
 	"github.com/vladislav-k/tui-claude/internal/session"
 )
+
+// dbg is a temporary debug logger; writes to /tmp/tui-debug.log.
+var dbg *log.Logger
+
+func init() {
+	f, err := os.OpenFile("/tmp/tui-debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		dbg = log.New(os.Stderr, "[DBG] ", log.Ltime|log.Lmicroseconds)
+	} else {
+		dbg = log.New(f, "", log.Ltime|log.Lmicroseconds)
+	}
+}
 
 // State represents the current UI state.
 type State int
@@ -53,7 +66,7 @@ type Model struct {
 	searchInput textinput.Model
 
 	// Tab state
-	activeTab    int // 0 = All, 1+ = project index
+	activeTab     int           // 0 = All, 1+ = project index
 	allMode       bool          // true = show all sessions, false = current dir only
 	sessionFilter SessionFilter // Active / Inactive / Archived
 	previewMode   PreviewMode
@@ -179,39 +192,120 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastError = msg.Err.Error()
 			return m, nil
 		}
-		// Preserve synthetic "new-*" entries for running sessions not yet on disk
-		newSessions := msg.Sessions
-		for _, old := range m.allSessions {
-			if len(old.SessionID) <= 4 || old.SessionID[:4] != "new-" {
-				continue
+		dbg.Printf("SessionsLoadedMsg: %d sessions from index, runningIDs=%v", len(msg.Sessions), m.runningIDs)
+		for _, s := range msg.Sessions {
+			if m.ptyMgr.IsRunning(s.SessionID) {
+				dbg.Printf(
+					"  index session (running): id=%s path=%q summary=%q fp=%q mc=%d",
+					s.SessionID,
+					s.FullPath,
+					s.Summary,
+					s.FirstPrompt[:min(len(s.FirstPrompt), 40)],
+					s.MsgCount,
+				)
 			}
+		}
+		// Preserve running sessions absent from the index. This covers both
+		// synthetic "new-*" entries and rekeyed sessions whose JSONL exists
+		// on disk but hasn't been added to sessions-index.json yet.
+		newSessions := msg.Sessions
+		indexIDs := make(map[string]bool, len(newSessions))
+		for _, ns := range newSessions {
+			indexIDs[ns.SessionID] = true
+		}
+		for _, old := range m.allSessions {
 			if !m.ptyMgr.IsRunning(old.SessionID) {
 				continue
 			}
-			// Check if still absent from disk data
-			found := false
-			for _, ns := range newSessions {
-				if ns.SessionID == old.SessionID {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !indexIDs[old.SessionID] {
 				newSessions = append(newSessions, old)
+			}
+		}
+		// Preserve enriched metadata for running sessions so that a stale
+		// sessions-index.json doesn't overwrite fresh JSONL-based data.
+		enriched := make(map[string]session.Session)
+		for _, old := range m.allSessions {
+			if m.ptyMgr.IsRunning(old.SessionID) {
+				enriched[old.SessionID] = old
+			}
+		}
+		for i, ns := range newSessions {
+			if old, ok := enriched[ns.SessionID]; ok {
+				if old.Summary != "" && old.Summary != "New session" {
+					newSessions[i].Summary = old.Summary
+				}
+				if old.FirstPrompt != "" {
+					newSessions[i].FirstPrompt = old.FirstPrompt
+				}
+				if old.MsgCount > newSessions[i].MsgCount {
+					newSessions[i].MsgCount = old.MsgCount
+				}
 			}
 		}
 		m.allSessions = newSessions
 		m.projects = msg.Projects
 		m.rekeyNewSessions()
+		// Refresh running IDs after rekeying so that applyFilters and
+		// enrichRunningCmd see the real session UUIDs, not stale "new-*" keys.
+		m.runningIDs = m.ptyMgr.DetectRunning()
+		dbg.Printf("after rekey: runningIDs=%v", m.runningIDs)
+		for _, s := range m.allSessions {
+			if m.runningIDs[s.SessionID] {
+				dbg.Printf(
+					"  will enrich? id=%s path=%q summary=%q mc=%d",
+					s.SessionID,
+					s.FullPath,
+					s.Summary,
+					s.MsgCount,
+				)
+			}
+		}
 		m.applyFilters()
-		return m, nil
+		return m, m.enrichRunningCmd()
 
 	case RunningSessionsMsg:
+		// Detect sessions that just stopped — run one final enrichment
+		// so we pick up the summary entry Claude writes at session end.
+		var justStopped []struct{ id, path string }
+		for id := range m.runningIDs {
+			if !msg.RunningIDs[id] {
+				for _, s := range m.allSessions {
+					if s.SessionID == id && s.FullPath != "" {
+						justStopped = append(justStopped, struct{ id, path string }{id, s.FullPath})
+						break
+					}
+				}
+			}
+		}
 		m.runningIDs = msg.RunningIDs
 		m.applyFilters()
+		if len(justStopped) > 0 {
+			return m, func() tea.Msg {
+				results := make(enrichedSessionsMsg)
+				for _, r := range justStopped {
+					firstPrompt, summary, msgCount := session.ExtractMeta(r.path)
+					results[r.id] = enrichedMeta{
+						firstPrompt: firstPrompt,
+						summary:     summary,
+						msgCount:    msgCount,
+					}
+				}
+				return results
+			}
+		}
 		return m, nil
 
 	case enrichedSessionsMsg:
+		dbg.Printf("enrichedSessionsMsg: %d entries", len(msg))
+		for id, meta := range msg {
+			dbg.Printf(
+				"  enriched: id=%s summary=%q fp=%q mc=%d",
+				id,
+				meta.summary,
+				meta.firstPrompt[:min(len(meta.firstPrompt), 40)],
+				meta.msgCount,
+			)
+		}
 		for i := range m.allSessions {
 			if meta, ok := msg[m.allSessions[i].SessionID]; ok {
 				if meta.summary != "" {
@@ -268,14 +362,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if !found {
-			m.allSessions = append(m.allSessions, session.Session{
-				SessionID:   msg.sessionID,
-				ProjectPath: msg.projectPath,
-				ProjectName: filepath.Base(msg.projectPath),
-				Summary:     "New session",
-				Modified:    time.Now(),
-				IsRunning:   true,
-			})
+			m.allSessions = append(
+				m.allSessions, session.Session{
+					SessionID:   msg.sessionID,
+					ProjectPath: msg.projectPath,
+					ProjectName: filepath.Base(msg.projectPath),
+					Summary:     "New session",
+					Modified:    time.Now(),
+					IsRunning:   true,
+				},
+			)
 		}
 		m.applyFilters()
 		// Resize VT emulator and PTY to match preview panel
@@ -377,7 +473,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detectRunningCmd(),
 			tickCmd(2 * time.Second),
 			loadSessionsCmd(m.cfg.ClaudeDir),
-			m.enrichRunningCmd(),
 		}
 		// Auto-detach if attached session is no longer running
 		if m.attachedSessionID != "" && !m.ptyMgr.IsRunning(m.attachedSessionID) {
@@ -712,7 +807,8 @@ func (m Model) View() string {
 		content = m.renderSearchOverlay(content)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
 		tabBar,
 		content,
 		statusBar,
@@ -843,6 +939,12 @@ func (m *Model) rekeyNewSessions() {
 		return
 	}
 
+	// Build set of known session IDs so we skip them during filesystem scan.
+	known := make(map[string]bool, len(m.allSessions))
+	for _, s := range m.allSessions {
+		known[s.SessionID] = true
+	}
+
 	for newID, projPath := range pending {
 		// Extract creation time from "new-<unixnano>" ID
 		var createdNano int64
@@ -852,6 +954,7 @@ func (m *Model) rekeyNewSessions() {
 		// Find the newest disk session matching this project path
 		// that was modified AFTER the PTY was created and isn't already tracked
 		var bestID string
+		var bestPath string
 		var bestTime time.Time
 		for _, s := range m.allSessions {
 			if s.ProjectPath != projPath {
@@ -869,13 +972,40 @@ func (m *Model) rekeyNewSessions() {
 			if s.Modified.After(bestTime) {
 				bestTime = s.Modified
 				bestID = s.SessionID
+				bestPath = s.FullPath
 			}
 		}
+
+		// Fallback: scan the project directory for JSONL files not in the
+		// index. Claude CLI may not update sessions-index.json while a
+		// session is active, so the real JSONL file exists on disk but is
+		// absent from m.allSessions.
+		if bestID == "" {
+			bestID, bestPath, bestTime = m.scanForNewSession(projPath, createdTime, known)
+		}
+
 		if bestID != "" {
+			dbg.Printf("rekey: %s -> %s (path=%s)", newID, bestID, bestPath)
 			m.ptyMgr.RekeySession(newID, bestID)
 			// Update attachedSessionID if this was the embedded session
 			if m.attachedSessionID == newID {
 				m.attachedSessionID = bestID
+			}
+			// If the real session wasn't in allSessions (found via scan),
+			// add it so enrichRunningCmd can read its JSONL.
+			if !known[bestID] {
+				m.allSessions = append(
+					m.allSessions, session.Session{
+						SessionID:   bestID,
+						FullPath:    bestPath,
+						Modified:    bestTime,
+						Created:     createdTime,
+						ProjectPath: projPath,
+						ProjectName: filepath.Base(projPath),
+						Summary:     "New session",
+					},
+				)
+				known[bestID] = true
 			}
 			// Remove the synthetic entry now that we have the real one
 			for i, s := range m.allSessions {
@@ -886,6 +1016,46 @@ func (m *Model) rekeyNewSessions() {
 			}
 		}
 	}
+}
+
+// scanForNewSession scans the project directory on disk for a JSONL file
+// that appeared after createdTime and is not already tracked in known.
+func (m *Model) scanForNewSession(projPath string, createdTime time.Time, known map[string]bool) (id, fullPath string, modTime time.Time) {
+	// Encode project path to directory name (Claude CLI convention).
+	encoded := strings.NewReplacer("/", "-", ".", "-").Replace(projPath)
+	projDir := filepath.Join(m.cfg.ClaudeDir, encoded)
+
+	entries, err := os.ReadDir(projDir)
+	if err != nil {
+		return "", "", time.Time{}
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		sessionID := strings.TrimSuffix(name, ".jsonl")
+		if known[sessionID] {
+			continue
+		}
+		if m.ptyMgr.IsRunning(sessionID) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if !info.ModTime().After(createdTime.Add(-5 * time.Second)) {
+			continue
+		}
+		if info.ModTime().After(modTime) {
+			modTime = info.ModTime()
+			id = sessionID
+			fullPath = filepath.Join(projDir, name)
+		}
+	}
+	return id, fullPath, modTime
 }
 
 func (m *Model) updateSessionSummary(id, summary string) {
@@ -1038,7 +1208,14 @@ func (m Model) renderContent() string {
 	if m.focusPanel == FocusRight && m.attachedSessionID != "" {
 		previewBorderColor = ColorBorderActive
 	}
-	previewPanel := renderTitledPanel(previewTitle, previewContent, previewWidth, contentHeight, previewBorderColor, previewTitleColor)
+	previewPanel := renderTitledPanel(
+		previewTitle,
+		previewContent,
+		previewWidth,
+		contentHeight,
+		previewBorderColor,
+		previewTitleColor,
+	)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, listPanel, previewPanel)
 }
@@ -1356,7 +1533,8 @@ func renderMessages(msgs []ParsedMessage, width int) string {
 
 // placeOverlay places a dialog box centered over the base content.
 func placeOverlay(width, height int, overlay, base string) string {
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
+	return lipgloss.Place(
+		width, height, lipgloss.Center, lipgloss.Center,
 		overlay,
 		lipgloss.WithWhitespaceChars(" "),
 	)
@@ -1547,7 +1725,9 @@ func (m Model) enrichRunningCmd() tea.Cmd {
 type tickMsg time.Time
 
 func tickCmd(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
+	return tea.Tick(
+		d, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		},
+	)
 }
